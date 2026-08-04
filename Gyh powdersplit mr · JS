@@ -37,6 +37,21 @@
  * definition, so this script derives both from a single input and cannot
  * reproduce that drift. 125 already-split parts in PROD have the mismatch.
  *
+ * BUGFIX (08/2026): the child's new BOM must be created AFTER the fab BOM is
+ * renamed off the "<origName> BOM" name, not before -- that name still
+ * belongs to the (as-yet unrenamed) fab BOM at the point the old code tried
+ * to reuse it, so createBom() collided with it on every single part. Fixed
+ * by renaming the fab BOM first, which frees the name for the child's clone.
+ *
+ * RESUME SUPPORT: if a run dies after the rename+copy step but before the
+ * BOM/routing rebuild (exactly what the ordering bug above caused), the item
+ * split is already done and safe -- record.copy() carries the original BOM
+ * assignment onto the child as a side effect, so both items still point at
+ * the same untouched BOM/routing until the rebuild finishes. row.resume=true
+ * skips the rename+copy and picks up directly at the BOM/routing rebuild
+ * using row.parentInternalId (the already-renamed parent) and
+ * row.itemInternalId (the already-created child).
+ *
  * @NApiVersion 2.1
  * @NScriptType MapReduceScript
  * @NModuleScope SameAccount
@@ -91,7 +106,6 @@ define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
 
   // ------------------------------------------------------------------- work
   const splitPart = (row, result) => {
-    const origId     = Number(row.itemInternalId);
     const origName   = String(row.partNumber).trim();
     const parentName = String(row.parentName).trim();
     const phantomId  = Number(row.phantomItemId);
@@ -99,55 +113,94 @@ define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
     const hangers    = Number(row.hangers);
     const runRate    = hangers;   // same number by definition -- see header note
     const fabBomId   = row.fabBomId ? Number(row.fabBomId) : null;
+    const resume     = !!row.resume;
 
     const cutover = parseDate(row.cutoverDate);          // new parent rev starts here
     const dayBefore = addDays(cutover, -1);              // old fab rev ends here
 
-    // ------------------------------------------------ 1. rename the original
-    const parent = record.load({ type: record.Type.ASSEMBLY_ITEM, id: origId, isDynamic: false });
-    const baseDisplay = String(parent.getValue({ fieldId: 'displayname' }) || '').trim();
-    parent.setValue({ fieldId: 'itemid', value: parentName });
-    if (colorLabel && baseDisplay.toUpperCase().indexOf(colorLabel.toUpperCase()) === -1) {
-      parent.setValue({ fieldId: 'displayname', value: (baseDisplay + ' ' + colorLabel).trim() });
-    }
-    parent.setValue({ fieldId: 'costestimatetype', value: CFG.COST_ESTIMATE_TYPE });
-    parent.save({ ignoreMandatoryFields: true });
-    result.created.parentId = origId;
-    result.created.parentName = parentName;
+    let origId, childId, baseDisplay;
 
-    // -------------------------------------------- 2. copy out the bare child
-    const child = record.copy({ type: record.Type.ASSEMBLY_ITEM, id: origId, isDynamic: false });
-    child.setValue({ fieldId: 'itemid', value: origName });
-    child.setValue({ fieldId: 'displayname', value: baseDisplay });   // color-free
-    child.setValue({ fieldId: 'costestimatetype', value: CFG.COST_ESTIMATE_TYPE });
-    adjustChild(child);
-    const childId = child.save({ ignoreMandatoryFields: true });
-    result.created.childId = childId;
-    result.created.childName = origName;
+    if (resume) {
+      // A prior attempt already renamed the parent and copied out the child
+      // (record.copy() carries the original BOM assignment over as a side
+      // effect, so both items still safely share the old, untouched BOM at
+      // this point -- nothing is broken, just unfinished). Pick up from
+      // there instead of renaming/copying again.
+      origId = Number(row.parentInternalId);
+      childId = Number(row.itemInternalId);
+      const parentRec = record.load({ type: record.Type.ASSEMBLY_ITEM, id: origId, isDynamic: false });
+      baseDisplay = String(parentRec.getValue({ fieldId: 'displayname' }) || '')
+        .replace(new RegExp('\\s*' + colorLabel + '\\s*$', 'i'), '').trim();
+      result.created.parentId = origId;
+      result.created.parentName = parentName;
+      result.created.childId = childId;
+      result.created.childName = origName;
+      result.notes.push('Resumed a prior attempt: item rename and child copy were already done; ' +
+                        'only the BOM/routing rebuild ran this time.');
+    } else {
+      origId = Number(row.itemInternalId);
+
+      // ------------------------------------------------ 1. rename the original
+      const parent = record.load({ type: record.Type.ASSEMBLY_ITEM, id: origId, isDynamic: false });
+      baseDisplay = String(parent.getValue({ fieldId: 'displayname' }) || '').trim();
+      parent.setValue({ fieldId: 'itemid', value: parentName });
+      if (colorLabel && baseDisplay.toUpperCase().indexOf(colorLabel.toUpperCase()) === -1) {
+        parent.setValue({ fieldId: 'displayname', value: (baseDisplay + ' ' + colorLabel).trim() });
+      }
+      parent.setValue({ fieldId: 'costestimatetype', value: CFG.COST_ESTIMATE_TYPE });
+      parent.save({ ignoreMandatoryFields: true });
+      result.created.parentId = origId;
+      result.created.parentName = parentName;
+
+      // -------------------------------------------- 2. copy out the bare child
+      const child = record.copy({ type: record.Type.ASSEMBLY_ITEM, id: origId, isDynamic: false });
+      child.setValue({ fieldId: 'itemid', value: origName });
+      child.setValue({ fieldId: 'displayname', value: baseDisplay });   // color-free
+      child.setValue({ fieldId: 'costestimatetype', value: CFG.COST_ESTIMATE_TYPE });
+      adjustChild(child);
+      childId = child.save({ ignoreMandatoryFields: true });
+      result.created.childId = childId;
+      result.created.childName = origName;
+    }
 
     if (!fabBomId) {
       result.notes.push('No master-default BOM on the original item. No child BOM built and ' +
                         'no routing repointed -- the powder BOM/routing below is all that was made.');
     }
 
-    // ------------------------------- 3. clone the fab revision to a new BOM
-    //    The child gets its own BOM record so the parent can keep the
-    //    original one (and its revision history) intact.
+    // ------------------------- 3. rename the fab BOM out of the way FIRST --
+    //    it currently still holds the name "<origName> BOM" (e.g. "101320
+    //    BOM"), which is exactly the name the child's new BOM needs below.
+    //    Renaming this one to the parent name frees that name up. Doing
+    //    this step AFTER creating the child's BOM (the old order) collided
+    //    with this record's own pre-existing name on every single part.
     let childBomId = null;
     if (fabBomId) {
       const fabRevId = row.fabRevId ? Number(row.fabRevId) : getCurrentRevision(fabBomId, origId);
       if (!fabRevId) throw new Error('Could not resolve the current revision on BOM ' + fabBomId + '.');
 
       const srcRev = record.load({ type: record.Type.BOM_REVISION, id: fabRevId, isDynamic: false });
+      const srcRevName = srcRev.getValue({ fieldId: 'name' });
 
-      childBomId = createBom(origName + ' BOM');
+      const bom = record.load({ type: record.Type.BOM, id: fabBomId, isDynamic: false });
+      const fabSubs = getBomSubsidiaries(fabBomId);
+      const alreadyRenamed = String(bom.getValue({ fieldId: 'name' })) === (parentName + ' BOM');
+      if (!alreadyRenamed) {
+        bom.setValue({ fieldId: 'name', value: parentName + ' BOM' });
+        bom.save({ ignoreMandatoryFields: true });
+      }
+      result.created.parentBomId = fabBomId;
+
+      // ------------------------- 4. now the original name is free: give the
+      //    child its own clone of the fab revision under that name.
+      childBomId = createBom(origName + ' BOM', fabSubs);
       result.created.childBomId = childBomId;
       result.created.childRevisionId = cloneRevision(srcRev, childBomId);
 
       // the copy inherited the parent's BOM line -- swap it for the new one
       replaceBoms(childId, childBomId);
 
-      // ----------------------- 4. repoint the live fab routing to that BOM
+      // ----------------------- 5. repoint the live fab routing to that BOM
       const moved = repointRoutings(fabBomId, childBomId);
       result.created.routingsRepointed = moved;
       if (!moved.length) {
@@ -155,27 +208,32 @@ define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
                           fabBomId + ', so nothing was repointed to the child.');
       }
 
-      // ------------------- 5. rename the original BOM, close the old rev,
-      //                       add the powder rev
-      const bom = record.load({ type: record.Type.BOM, id: fabBomId, isDynamic: false });
-      bom.setValue({ fieldId: 'name', value: parentName + ' BOM' });
-      bom.save({ ignoreMandatoryFields: true });
-      result.created.parentBomId = fabBomId;
+      // ------------------- 6. close the old rev, add the powder rev
+      const revAlreadyEndDated = !!srcRev.getValue({ fieldId: 'effectiveenddate' });
+      if (!revAlreadyEndDated) endDateRevision(fabRevId, dayBefore);
 
-      endDateRevision(fabRevId, dayBefore);
-
-      const letter = revisionLetter(srcRev.getValue({ fieldId: 'name' }));
+      const letter = revisionLetter(srcRevName);
       result.created.parentRevisionId = createPowderRevision(
         fabBomId, parentName + ' BOM REV ' + letter, cutover, childId, phantomId, hangers
       );
       result.created.parentRevisionName = parentName + ' BOM REV ' + letter;
 
-      // ---------------------------------- 6. powder routing on the same BOM
+      // ---------------------------------- 7. powder routing on the same BOM
       result.created.routingId = createRouting(parentName, fabBomId, runRate);
 
     } else {
       // No pre-existing BOM: build the powder BOM from scratch on the parent.
-      const bomId = createBom(parentName + ' BOM');
+      // No source BOM to inherit from, so mirror the item's own subsidiaries.
+      let itemSubs = null;
+      try {
+        const it = record.load({ type: record.Type.ASSEMBLY_ITEM, id: origId, isDynamic: false });
+        const v = it.getValue({ fieldId: 'subsidiary' });
+        itemSubs = Array.isArray(v) ? v
+          : (v ? String(v).split(',').map((s) => s.trim()).filter((s) => s) : null);
+      } catch (e) {
+        log.audit('Could not read subsidiaries off item ' + origId, e.message);
+      }
+      const bomId = createBom(parentName + ' BOM', itemSubs);
       result.created.parentBomId = bomId;
       result.created.parentRevisionName = parentName + ' BOM REV A';
       result.created.parentRevisionId = createPowderRevision(
@@ -211,15 +269,39 @@ define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
     return r.length && r[0].currentrevision ? Number(r[0].currentrevision) : null;
   };
 
-  const createBom = (name) => {
+  /**
+   * Create a BOM. `subsidiaries` should be the subsidiary list read off the
+   * BOM being cloned -- these items commonly sit on BOTH GEN-Y HITCH (2) and
+   * GEN-Y TECH (4), and every fab BOM checked in PROD and SB2 carries "2, 4".
+   * Hardcoding just CFG.SUBSIDIARY would create the child BOM narrower than
+   * the parent it was cloned from and break it for TECH-side activity.
+   */
+  const createBom = (name, subsidiaries) => {
     const bom = record.create({ type: record.Type.BOM, isDynamic: false });
     bom.setValue({ fieldId: 'name', value: name });
     bom.setValue({ fieldId: 'includechildren', value: false });
     bom.setValue({ fieldId: 'usecomponentyield', value: false });
     bom.setValue({ fieldId: 'availableforallassemblies', value: false });
     bom.setValue({ fieldId: 'availableforalllocations', value: true });  // must be T
-    bom.setValue({ fieldId: 'subsidiary', value: [CFG.SUBSIDIARY] });
+    bom.setValue({
+      fieldId: 'subsidiary',
+      value: (subsidiaries && subsidiaries.length) ? subsidiaries : [CFG.SUBSIDIARY]
+    });
     return bom.save({ ignoreMandatoryFields: true });
+  };
+
+  /** Read the subsidiary list off an existing BOM record. */
+  const getBomSubsidiaries = (bomId) => {
+    try {
+      const bom = record.load({ type: record.Type.BOM, id: bomId, isDynamic: false });
+      const v = bom.getValue({ fieldId: 'subsidiary' });
+      if (Array.isArray(v)) return v;
+      if (v === null || v === '') return null;
+      return String(v).split(',').map((s) => s.trim()).filter((s) => s);
+    } catch (e) {
+      log.audit('Could not read subsidiaries off BOM ' + bomId, e.message);
+      return null;
+    }
   };
 
   /** Copy every component of an existing revision onto a new BOM, verbatim. */
