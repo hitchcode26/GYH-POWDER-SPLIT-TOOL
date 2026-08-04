@@ -457,8 +457,9 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
   // ------------------------------------------------------------------- view
   // Returns ONLY the scoped fragment that goes into the INLINEHTML field --
   // no <html>/<head>/<body>. Everything is nested inside #WRAPPER_ID so the
-  // CSS/JS can't touch anything outside it, and the only thing reaching
-  // outside that div is the one rule that hides NetSuite's own title band.
+  // CSS/JS can't touch anything outside it. NetSuite's own page title band is
+  // left visible and serves as the heading, so nothing outside the wrapper is
+  // hidden or altered at all.
   const renderPage = () => {
     const colors = getColors().map((c) => {
       const res = resolveColor(c.itemid);
@@ -468,54 +469,68 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
 
     return '<style>' + css(W) + '</style>' +
       '<div id="' + W + '">' +
-        '<header><h1>Add Powder Coat Step to Parts</h1>' +
-        '<p class="sub">Renames each part to <code>&lt;part&gt; - &lt;color code&gt;</code> ' +
-        '(SV / BK / WH / RED) as the coated parent, copies it back out under the original number ' +
-        'as the bare child, then rebuilds the BOMs and routings the same way 101798 was done.</p></header>' +
 
-        '<section class="card">' +
-          '<h2>1 &middot; Load part numbers</h2>' +
-          '<div class="bulk">' +
-            '<textarea id="bulk" rows="4" placeholder="Paste part numbers, one per line&#10;101798&#10;106064&#10;107169"></textarea>' +
-            '<div class="bulkside">' +
-              '<label>Default color</label><select id="defColor"></select>' +
-              '<label>Default hangers / unit</label>' +
-              '<input id="defHangers" type="number" step="0.01" min="0" value="' + CFG.DEFAULT_HANGERS + '">' +
-              '<button type="button" class="btn" onclick="gyhPS_addBulk()">Add to grid</button>' +
-            '</div>' +
+        '<div class="intro">Renames each part to <b>&lt;part&gt; - &lt;color code&gt;</b> ' +
+        '(SV / BK / WH / RED) as the coated parent, copies it back out under the original ' +
+        'number as the bare child, then rebuilds the BOMs and routings.</div>' +
+
+        '<div class="fgroup">' +
+          '<div class="fghead">Load Part Numbers</div>' +
+          '<div class="fgbody">' +
+            '<table class="layout"><tr>' +
+              '<td class="lcell">' +
+                '<div class="flabel">Part Numbers</div>' +
+                '<textarea id="bulk" rows="5" placeholder="One per line&#10;101798&#10;106064&#10;107169"></textarea>' +
+              '</td>' +
+              '<td class="rcell">' +
+                '<div class="flabel">Default Color</div>' +
+                '<select id="defColor"></select>' +
+                '<div class="flabel">Default Hangers / Unit</div>' +
+                '<input id="defHangers" type="number" step="0.01" min="0" value="' + CFG.DEFAULT_HANGERS + '">' +
+                '<button type="button" class="btn primary block" onclick="gyhPS_addBulk()">Add To Grid</button>' +
+              '</td>' +
+            '</tr></table>' +
           '</div>' +
-        '</section>' +
+        '</div>' +
 
-        '<section class="card">' +
-          '<div class="cardhead"><h2>2 &middot; Review rows</h2>' +
-            '<div><button type="button" class="btn ghost" onclick="gyhPS_addRow()">+ Row</button>' +
-            '<button type="button" class="btn ghost" onclick="gyhPS_clearRows()">Clear</button></div></div>' +
-          '<table><thead><tr>' +
-            '<th style="width:15%">Part number</th>' +
-            '<th style="width:14%">Becomes parent</th>' +
-            '<th style="width:26%">Color (phantom)</th>' +
-            '<th style="width:10%">Hangers / unit</th>' +
-            '<th>Status</th><th style="width:30px"></th>' +
+        '<div class="fgroup">' +
+          '<div class="fghead">Review Rows' +
+            '<span class="fgbtns">' +
+              '<button type="button" class="btn sm" onclick="gyhPS_addRow()">Add Row</button>' +
+              '<button type="button" class="btn sm" onclick="gyhPS_clearRows()">Clear</button>' +
+            '</span>' +
+          '</div>' +
+          '<table class="sublist"><thead><tr>' +
+            '<th class="c-part">Part Number</th>' +
+            '<th class="c-par">Becomes Parent</th>' +
+            '<th class="c-col">Color (Phantom)</th>' +
+            '<th class="c-qty">Hangers</th>' +
+            '<th class="c-st">Status</th>' +
+            '<th class="c-x"></th>' +
           '</tr></thead><tbody id="body"></tbody></table>' +
-          '<p class="hint">One number, used for both the phantom BOM quantity and the ' +
-          'POWDERCOAT operation run rate &mdash; they are the same thing by definition.</p>' +
-        '</section>' +
+          '<div class="fgnote">One number drives both the phantom BOM quantity and the ' +
+          'POWDERCOAT operation run rate &mdash; they are the same thing by definition.</div>' +
+        '</div>' +
 
-        '<section class="card">' +
-          '<h2>3 &middot; Validate, then commit</h2>' +
-          '<div class="actions">' +
-            '<label class="inline">Cutover date <input id="cutover" type="text" placeholder="m/d/yyyy" style="width:110px"></label>' +
-            '<button type="button" class="btn" id="btnVal" onclick="gyhPS_doValidate()">Validate (read only)</button>' +
-            '<button type="button" class="btn go" id="btnGo" onclick="gyhPS_doCommit()" disabled>Commit split</button>' +
-            '<span id="msg" class="msg"></span>' +
+        '<div class="fgroup">' +
+          '<div class="fghead">Validate, Then Commit</div>' +
+          '<div class="fgbody">' +
+            '<div class="actions">' +
+              '<span class="flabel inline">Cutover Date</span>' +
+              '<input id="cutover" type="text" class="dt">' +
+              '<button type="button" class="btn" id="btnVal" onclick="gyhPS_doValidate()">Validate (Read Only)</button>' +
+              '<button type="button" class="btn primary" id="btnGo" onclick="gyhPS_doCommit()" disabled>Commit Split</button>' +
+              '<span id="msg" class="msg"></span>' +
+            '</div>' +
+            '<div class="fgnote">The old fab revision is end-dated the day before the cutover ' +
+            'date and the new powder revision starts on it.</div>' +
+            '<div class="banner"><b>This cannot be undone here.</b> On-hand stays on the coated ' +
+            'parent and the child starts at zero &mdash; move stock manually if what is ' +
+            'physically on the shelf is bare. Vendor records and purchase prices also stay ' +
+            'on the parent.</div>' +
           '</div>' +
-          '<p class="hint">The old fab revision is end-dated the day before the cutover date and the ' +
-          'new powder revision starts on it.</p>' +
-          '<p class="warn"><b>This cannot be undone from here.</b> Run it in SB2 first. ' +
-          'On-hand stays on the parent, which is now the coated color-coded item, ' +
-          'and the child starts at zero &mdash; move stock by hand if what is physically ' +
-          'on the shelf is bare. Vendor records and purchase prices also stay on the parent.</p>' +
-        '</section>' +
+        '</div>' +
+
       '</div>' +
       '<script>(function(){' +
       'var COLORS=' + JSON.stringify(colors) + ';var SEP=' + JSON.stringify(CFG.SUFFIX_SEP) +
@@ -554,11 +569,12 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
     'if(tb.rows.length>=MAXROWS){alert("Max "+MAXROWS+" rows per run.");return;}',
     'var tr=tb.insertRow();tr.innerHTML=',
     '"<td><input class=\'p\' value=\'"+(part||"")+"\' oninput=\'gyhPS_syncName(this)\'></td>"+',
-    '"<td class=\'pn mono\'></td>"+',
+    '"<td class=\'pn\'></td>"+',
     '"<td><select class=\'c\' onchange=\'gyhPS_syncName(this)\'>"+colorOpts(color)+"</select></td>"+',
     '"<td><input class=\'h\' type=\'number\' step=\'0.01\' min=\'0\' value=\'"+(hangers||"")+"\'></td>"+',
     '"<td class=\'st\'></td>"+',
-    '"<td><button type=\'button\' class=\'x\' onclick=\'gyhPS_removeRow(this)\'>&times;</button></td>";',
+    '"<td class=\'c-x\'><button type=\'button\' class=\'x\' title=\'Remove\' ',
+    'onclick=\'gyhPS_removeRow(this)\'>&#10005;</button></td>";',
     'refreshName(tr);}',
 
     'function removeRow(btn){btn.closest("tr").remove();dirty();}',
@@ -590,17 +606,19 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
     '.catch(function(e){b.disabled=false;setMsg("Request failed: "+e,"e");});}',
 
     'function plan(r){var p=[];',
-    'if(r.mode==="descriptions"){p.push("<b>DESCRIPTIONS ONLY</b>: append the color to <span class=\'mono\'>"',
-    '+r.parentName+"</span>, strip it from <span class=\'mono\'>"+r.partNumber+"</span>");',
-    'return "<div class=\'plan\'>"+p.join(" &middot; ")+"</div>";}',
-    'if(r.resume){p.push("<b>RESUME</b>: rename+copy already done, finishing BOM/routing only");}',
-    'if(r.fabBomName){p.push("BOM <span class=\'mono\'>"+r.fabBomName+"</span> renamed, rev <span class=\'mono\'>"',
-    '+(r.fabRevName||"?")+"</span> closed, <span class=\'mono\'>"+r.newRevName+"</span> added");',
-    'p.push("child BOM <span class=\'mono\'>"+r.partNumber+" BOM</span> cloned from it");}',
-    'if(r.routings&&r.routings.length){p.push("repoint "+r.routings.length+" routing: <span class=\'mono\'>"',
-    '+r.routings.join(", ")+"</span>");}',
-    'p.push("new <span class=\'mono\'>"+r.parentName+" ROUTING</span> @ run rate "+r.hangers);',
-    'return "<div class=\'plan\'>"+p.join(" &middot; ")+"</div>";}',
+    'if(r.mode==="descriptions"){',
+    'return "<div class=\'plan\'>Append color to <span class=\'mono\'>"+r.parentName+',
+    '"</span>, strip from <span class=\'mono\'>"+r.partNumber+"</span>. No BOM or routing changes.</div>";}',
+    'if(r.resume){p.push("Rename and copy already done &ndash; finishing BOM and routing only.");}',
+    'if(r.fabBomName){p.push("BOM <span class=\'mono\'>"+r.fabBomName+"</span> renamed; rev <span class=\'mono\'>"',
+    '+(r.fabRevName||"?")+"</span> closed; <span class=\'mono\'>"+r.newRevName+"</span> added.");',
+    'p.push("Child BOM <span class=\'mono\'>"+r.partNumber+" BOM</span> cloned from it.");}',
+    'if(r.routings&&r.routings.length){p.push("Repoint "+r.routings.length+" routing: <span class=\'mono\'>"',
+    '+r.routings.join(", ")+"</span>.");}',
+    'p.push("New <span class=\'mono\'>"+r.parentName+" ROUTING</span> at run rate "+r.hangers+".");',
+    'return "<div class=\'plan\'>"+p.join(" ")+"</div>";}',
+
+    'function badge(kind,text){return "<span class=\'badge "+kind+"\'>"+text+"</span>";}',
 
     'function doValidate(){var rows=collect();if(!rows.length){setMsg("Add some part numbers first.","e");return;}',
     'setMsg("Validating...","");',
@@ -608,10 +626,11 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
     'if(!d.ok){setMsg(d.error||"Validation failed.","e");return;}',
     'var tb=$("#body").rows;var errs=0,warns=0;',
     'for(var i=0;i<d.rows.length;i++){var r=d.rows[i];var cell=tb[i].querySelector(".st");',
-    'if(r.status==="error"){errs++;cell.innerHTML="<span class=\'bad\'>ERROR</span> "+r.messages.join(" ");}',
-    'else if(r.status==="warn"){warns++;cell.innerHTML="<span class=\'wrn\'>CHECK</span> "+r.messages.join(" ")+plan(r);}',
-    'else{cell.innerHTML="<span class=\'good\'>READY</span>"+plan(r);}}',
-    'if(errs){setMsg(errs+" error(s) -- fix before committing.","e");}',
+    'var note=r.messages&&r.messages.length?"<div>"+r.messages.join(" ")+"</div>":"";',
+    'if(r.status==="error"){errs++;cell.innerHTML=badge("bad","ERROR")+note;}',
+    'else if(r.status==="warn"){warns++;cell.innerHTML=badge("wrn",r.mode==="descriptions"?"DESC ONLY":"CHECK")+note+plan(r);}',
+    'else{cell.innerHTML=badge("good","READY")+plan(r);}}',
+    'if(errs){setMsg(errs+" error(s) \u2013 fix before committing.","e");}',
     'else{$("#btnGo").disabled=false;',
     'setMsg("Ready: "+d.rows.length+" part(s)"+(warns?", "+warns+" with warnings":"")+".","g");}});}',
 
@@ -634,54 +653,89 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
     'addRow();'
   ].join('');
 
-  // All selectors are prefixed with #WRAPPER_ID so nothing here can leak
-  // onto or collide with the surrounding NetSuite page. The one exception
-  // is .uir-page-title, which is NetSuite's own page-title band -- that
-  // single global rule just hides it for a cleaner look; nothing else
-  // outside the wrapper is touched.
+  // Every selector is prefixed with #WRAPPER_ID, so nothing here can leak onto
+  // or collide with the surrounding NetSuite page. Nothing outside the wrapper
+  // is hidden or restyled -- NetSuite's own page title band is left alone and
+  // used as the page heading. Colors and metrics mirror NetSuite's native
+  // field groups and sublists so this reads as a standard record page.
   const css = (w) => [
-    '.uir-page-title{display:none}',
-
-    '#' + w + '{box-sizing:border-box;font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;',
-    'background:#f4f5f7;color:#1f2430;max-width:1240px;margin:0 auto;padding:20px}',
+    '#' + w + '{box-sizing:border-box;font:12px/1.4 Arial,Helvetica,sans-serif;',
+    'color:#333;background:#fff;padding:0 0 16px}',
     '#' + w + ' *{box-sizing:border-box}',
-    '#' + w + ' header h1{margin:0 0 4px;font-size:21px}',
-    '#' + w + ' header .sub{margin:0 0 18px;color:#667;max-width:900px}',
-    '#' + w + ' .card{background:#fff;border:1px solid #e2e5ea;border-radius:8px;padding:16px;margin-bottom:14px}',
-    '#' + w + ' .card h2{margin:0 0 12px;font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:#5a6474}',
-    '#' + w + ' .cardhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}',
-    '#' + w + ' .cardhead h2{margin:0}',
-    '#' + w + ' .bulk{display:flex;gap:14px}',
-    '#' + w + ' .bulk textarea{flex:1;padding:8px;border:1px solid #ccd2da;border-radius:6px;',
-    'font:12px/1.4 ui-monospace,Menlo,Consolas,monospace;resize:vertical}',
-    '#' + w + ' .bulkside{width:250px;display:flex;flex-direction:column;gap:4px}',
-    '#' + w + ' .bulkside label{font-size:11px;color:#667;text-transform:uppercase;letter-spacing:.04em}',
-    '#' + w + ' select,#' + w + ' input{padding:6px 7px;border:1px solid #ccd2da;border-radius:5px;font:inherit;width:100%;background:#fff}',
-    '#' + w + ' table{width:100%;border-collapse:collapse}',
-    '#' + w + ' th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:#5a6474;',
-    'padding:6px;border-bottom:1px solid #e2e5ea}',
-    '#' + w + ' td{padding:5px 6px;border-bottom:1px solid #f0f2f5;vertical-align:middle}',
-    '#' + w + ' .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}',
-    '#' + w + ' .pn{color:#2b6cb0}',
-    '#' + w + ' .st{font-size:12px;color:#556}',
-    '#' + w + ' .plan{margin-top:3px;color:#4a5568;font-size:11.5px}',
-    '#' + w + ' .btn{padding:7px 13px;border:1px solid #2b6cb0;background:#2b6cb0;color:#fff;border-radius:6px;',
-    'cursor:pointer;font:inherit;font-weight:600}',
-    '#' + w + ' .btn.ghost{background:#fff;color:#2b6cb0;margin-left:6px}',
-    '#' + w + ' .btn.go{background:#1f7a4d;border-color:#1f7a4d}',
-    '#' + w + ' .btn:disabled{opacity:.45;cursor:not-allowed}',
-    '#' + w + ' .x{border:none;background:none;color:#b33;font-size:17px;cursor:pointer;line-height:1}',
-    '#' + w + ' .actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
-    '#' + w + ' .inline{display:flex;align-items:center;gap:6px;font-size:12px;color:#5a6474;white-space:nowrap}',
-    '#' + w + ' .msg{font-weight:600}',
-    '#' + w + ' .msg.e{color:#b3261e}',
-    '#' + w + ' .msg.g{color:#1f7a4d}',
-    '#' + w + ' .good{color:#1f7a4d;font-weight:700}',
-    '#' + w + ' .wrn{color:#a86400;font-weight:700}',
-    '#' + w + ' .bad{color:#b3261e;font-weight:700}',
-    '#' + w + ' .hint{color:#889;font-size:12px;margin:8px 0 0}',
-    '#' + w + ' .warn{margin:12px 0 0;padding:9px 11px;background:#fff8e6;border:1px solid #f0dca8;border-radius:6px;color:#6b4e00}',
-    '#' + w + ' code{font-family:ui-monospace,Menlo,Consolas,monospace;background:#eef1f5;padding:1px 4px;border-radius:3px}'
+
+    '#' + w + ' .intro{color:#555;font-size:11px;margin:0 0 10px;line-height:1.5}',
+
+    // ---- field group: bordered box with a gray caption bar, like NetSuite
+    '#' + w + ' .fgroup{border:1px solid #c8ced6;background:#fff;margin:0 0 12px}',
+    '#' + w + ' .fghead{background:#e8eaed;border-bottom:1px solid #c8ced6;padding:5px 8px;',
+    'font-weight:bold;font-size:12px;color:#1a3d6d;position:relative}',
+    '#' + w + ' .fgbtns{position:absolute;right:6px;top:3px}',
+    '#' + w + ' .fgbody{padding:10px}',
+    '#' + w + ' .fgnote{padding:6px 8px;color:#666;font-size:11px;border-top:1px solid #eceff2}',
+
+    // ---- labels + inputs
+    '#' + w + ' .flabel{display:block;font-size:11px;color:#555;margin:0 0 2px}',
+    '#' + w + ' .flabel.inline{display:inline;margin:0 4px 0 0}',
+    '#' + w + ' input,#' + w + ' select,#' + w + ' textarea{font:12px Arial,Helvetica,sans-serif;',
+    'border:1px solid #7f9db9;background:#fff;color:#333;padding:2px 4px;width:100%}',
+    '#' + w + ' input:focus,#' + w + ' select:focus,#' + w + ' textarea:focus{outline:1px solid #4d90fe;',
+    'border-color:#4d90fe}',
+    '#' + w + ' textarea{font-family:Consolas,Monaco,monospace;resize:vertical}',
+    '#' + w + ' input.dt{width:90px}',
+    '#' + w + ' table.layout{width:auto;border-collapse:collapse}',
+    '#' + w + ' table.layout td{vertical-align:top;padding:0}',
+    '#' + w + ' td.lcell{width:430px;padding-right:16px}',
+    '#' + w + ' td.rcell{width:260px}',
+    '#' + w + ' td.rcell select,#' + w + ' td.rcell input{margin-bottom:8px}',
+
+    // ---- buttons: NetSuite grey default, blue primary
+    '#' + w + ' .btn{font:12px Arial,Helvetica,sans-serif;padding:3px 12px;cursor:pointer;',
+    'border:1px solid #a3adba;border-radius:3px;color:#333;',
+    'background:linear-gradient(#fdfdfd,#e6e8eb)}',
+    '#' + w + ' .btn:hover{background:linear-gradient(#fff,#dcdfe3)}',
+    '#' + w + ' .btn.sm{padding:1px 8px;font-size:11px}',
+    '#' + w + ' .btn.primary{border-color:#15417e;color:#fff;',
+    'background:linear-gradient(#4783c4,#1f5fa6)}',
+    '#' + w + ' .btn.primary:hover{background:linear-gradient(#5a92cf,#1a5493)}',
+    '#' + w + ' .btn.block{display:block;width:100%;padding:4px 12px}',
+    '#' + w + ' .btn:disabled{opacity:.5;cursor:default}',
+    '#' + w + ' .btn:disabled:hover{background:linear-gradient(#fdfdfd,#e6e8eb)}',
+
+    // ---- sublist grid. table-layout:fixed keeps the header cells locked to
+    // the body cells; without it the long Status text drags the columns out
+    // of alignment.
+    '#' + w + ' table.sublist{width:100%;border-collapse:collapse;table-layout:fixed}',
+    '#' + w + ' table.sublist th{background:#dfe3e8;border:1px solid #c8ced6;border-top:0;',
+    'text-align:left;font-size:11px;font-weight:bold;color:#33475b;padding:4px 6px;white-space:nowrap}',
+    '#' + w + ' table.sublist td{border:1px solid #dde2e8;padding:4px 6px;vertical-align:top}',
+    '#' + w + ' table.sublist tbody tr:nth-child(even) td{background:#f6f8fa}',
+    '#' + w + ' .c-part{width:110px}',
+    '#' + w + ' .c-par{width:130px}',
+    '#' + w + ' .c-col{width:230px}',
+    '#' + w + ' .c-qty{width:70px}',
+    '#' + w + ' .c-x{width:26px}',
+    '#' + w + ' td.c-x{text-align:center}',
+
+    '#' + w + ' .pn{color:#1a3d6d;font-weight:bold;font-size:11px;word-break:break-word}',
+    '#' + w + ' .st{font-size:11px;color:#555;line-height:1.5}',
+    '#' + w + ' .plan{margin-top:2px;color:#666;font-size:11px}',
+    '#' + w + ' .mono{font-family:Consolas,Monaco,monospace}',
+    '#' + w + ' .x{border:0;background:none;color:#a00;font-size:14px;cursor:pointer;padding:0;line-height:1}',
+
+    // ---- status badges
+    '#' + w + ' .badge{display:inline-block;font-size:10px;font-weight:bold;padding:1px 5px;',
+    'border:1px solid;border-radius:2px;margin-right:4px;vertical-align:1px}',
+    '#' + w + ' .badge.good{color:#1c6b3f;border-color:#a6d3b8;background:#eaf6ef}',
+    '#' + w + ' .badge.wrn{color:#8a5300;border-color:#e8ce93;background:#fdf6e6}',
+    '#' + w + ' .badge.bad{color:#a3231b;border-color:#e8b1ac;background:#fdeceb}',
+
+    '#' + w + ' .actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap}',
+    '#' + w + ' .msg{font-size:11px;font-weight:bold;margin-left:4px}',
+    '#' + w + ' .msg.e{color:#a3231b}',
+    '#' + w + ' .msg.g{color:#1c6b3f}',
+
+    '#' + w + ' .banner{margin:10px 0 0;padding:6px 8px;background:#fdf6e6;',
+    'border:1px solid #e8ce93;color:#6b4e00;font-size:11px;line-height:1.5}'
   ].join('');
 
   const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
