@@ -62,7 +62,8 @@ define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
   // ---------------------------------------------------------------- config
   // Verified against PROD account 5262266 on 2026-08-04.
   const CFG = {
-    PARAM: 'custscriptgyh_pcs_payload',  // confirmed on the Deployment Parameters tab in SB2 08/2026
+    PARAM: 'custscriptgyh_pcs_payload',  // confirmed in SB2; resolved by label if absent
+    PARAM_LABEL: 'Powder Split Payload', // used to resolve the real ID per account
 
     PC_OP_NAME: 'POWDERCOAT',   // 101798 used one word; older parts used "POWDER COAT"
     PC_OP_SEQ: 9,
@@ -81,10 +82,49 @@ define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
   };
 
   // ------------------------------------------------------------------ input
+  /**
+   * Read the payload. The parameter's real ID is auto-assigned by NetSuite and
+   * differs per account (SB2 ended up with "custscriptgyh_pcs_payload", not
+   * the "custscript_gyh_pcs_payload" that was typed), so try the known ID
+   * first and then fall back to resolving it by label.
+   */
+  const readPayload = () => {
+    const script = runtime.getCurrentScript();
+
+    let raw = null;
+    try { raw = script.getParameter({ name: CFG.PARAM }); } catch (e) { /* not defined here */ }
+    if (raw) return raw;
+
+    let resolvedId = null;
+    try {
+      const p = query.runSuiteQL({
+        query: 'SELECT scriptid FROM customfield ' +
+               "WHERE fieldtype = 'SCRIPT' AND UPPER(name) = ? AND ROWNUM <= 1",
+        params: [String(CFG.PARAM_LABEL).toUpperCase()]
+      }).asMappedResults();
+      if (p.length && p[0].scriptid) resolvedId = String(p[0].scriptid).toLowerCase();
+    } catch (e) {
+      log.audit('Parameter lookup by label failed', e.message);
+    }
+
+    if (resolvedId && resolvedId !== CFG.PARAM) {
+      try {
+        raw = script.getParameter({ name: resolvedId });
+        if (raw) {
+          log.audit('Payload read via resolved parameter ID', resolvedId);
+          return raw;
+        }
+      } catch (e) { /* fall through to the error below */ }
+    }
+
+    throw new Error('No payload found on "' + CFG.PARAM + '"' +
+      (resolvedId ? ' or "' + resolvedId + '"' : '') +
+      '. Launch this from the Suitelet, and confirm the script parameter ' +
+      '"' + CFG.PARAM_LABEL + '" exists as Long Text on this deployment.');
+  };
+
   const getInputData = () => {
-    const raw = runtime.getCurrentScript().getParameter({ name: CFG.PARAM });
-    if (!raw) throw new Error('No payload on ' + CFG.PARAM + '. Launch this from the Suitelet.');
-    const rows = JSON.parse(raw);
+    const rows = JSON.parse(readPayload());
     log.audit('Powder split starting', rows.length + ' part(s)');
     return rows;
   };
