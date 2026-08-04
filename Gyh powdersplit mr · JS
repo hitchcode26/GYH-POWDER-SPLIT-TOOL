@@ -193,7 +193,7 @@ define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
 
       // ------------------------- 4. now the original name is free: give the
       //    child its own clone of the fab revision under that name.
-      childBomId = createBom(origName + ' BOM', fabSubs);
+      childBomId = createBom(origName + ' BOM', fabSubs, [childId]);
       result.created.childBomId = childBomId;
       result.created.childRevisionId = cloneRevision(srcRev, childBomId);
 
@@ -233,7 +233,7 @@ define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
       } catch (e) {
         log.audit('Could not read subsidiaries off item ' + origId, e.message);
       }
-      const bomId = createBom(parentName + ' BOM', itemSubs);
+      const bomId = createBom(parentName + ' BOM', itemSubs, [origId]);
       result.created.parentBomId = bomId;
       result.created.parentRevisionName = parentName + ' BOM REV A';
       result.created.parentRevisionId = createPowderRevision(
@@ -270,24 +270,92 @@ define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
   };
 
   /**
-   * Create a BOM. `subsidiaries` should be the subsidiary list read off the
-   * BOM being cloned -- these items commonly sit on BOTH GEN-Y HITCH (2) and
-   * GEN-Y TECH (4), and every fab BOM checked in PROD and SB2 carries "2, 4".
-   * Hardcoding just CFG.SUBSIDIARY would create the child BOM narrower than
-   * the parent it was cloned from and break it for TECH-side activity.
+   * Create a BOM.
+   *
+   * `subsidiaries` should be the subsidiary list read off the BOM being cloned
+   * -- these items commonly sit on BOTH GEN-Y HITCH (2) and GEN-Y TECH (4),
+   * and every fab BOM checked in PROD and SB2 carries "2, 4". Hardcoding just
+   * CFG.SUBSIDIARY would create the child BOM narrower than the parent it was
+   * cloned from and break it for TECH-side activity.
+   *
+   * `assemblyIds` is REQUIRED in practice. A BOM saved with
+   * availableforallassemblies = F and an empty restricttoassemblies is
+   * available to NO assembly, so the later item-side assignment is rejected
+   * with "Invalid Field Value <bomid> for the following field: billofmaterials".
+   * Assigning from the item side does NOT back-fill this restriction -- the
+   * BOM has to be made available to the assembly first. Every working fab BOM
+   * in the account follows the same shape: allassemblies = F with the assembly
+   * listed in restricttoassemblies.
    */
-  const createBom = (name, subsidiaries) => {
+  const createBom = (name, subsidiaries, assemblyIds) => {
+    // A prior failed attempt may have already created this BOM (it is created
+    // before the assignment step that can fail). Reuse it instead of
+    // colliding on the name -- and re-apply the availability settings, since
+    // the earlier run is exactly what may have left them wrong.
+    const existing = findBomByName(name);
+    if (existing) {
+      log.audit('Reusing BOM ' + existing + ' left by a prior attempt', name);
+      try {
+        const vals = {};
+        if (assemblyIds && assemblyIds.length) {
+          vals.availableforallassemblies = false;
+          vals.restricttoassemblies = assemblyIds;
+        }
+        if (Object.keys(vals).length) {
+          record.submitFields({
+            type: record.Type.BOM, id: existing, values: vals,
+            options: { ignoreMandatoryFields: true }
+          });
+        }
+      } catch (e) {
+        log.audit('Could not re-apply availability on reused BOM ' + existing, e.message);
+      }
+      return existing;
+    }
+
     const bom = record.create({ type: record.Type.BOM, isDynamic: false });
     bom.setValue({ fieldId: 'name', value: name });
     bom.setValue({ fieldId: 'includechildren', value: false });
     bom.setValue({ fieldId: 'usecomponentyield', value: false });
-    bom.setValue({ fieldId: 'availableforallassemblies', value: false });
     bom.setValue({ fieldId: 'availableforalllocations', value: true });  // must be T
     bom.setValue({
       fieldId: 'subsidiary',
       value: (subsidiaries && subsidiaries.length) ? subsidiaries : [CFG.SUBSIDIARY]
     });
+
+    let restricted = false;
+    if (assemblyIds && assemblyIds.length) {
+      try {
+        bom.setValue({ fieldId: 'availableforallassemblies', value: false });
+        bom.setValue({ fieldId: 'restricttoassemblies', value: assemblyIds });
+        restricted = true;
+      } catch (e) {
+        log.audit('Could not set restricttoassemblies on new BOM "' + name + '"', e.message);
+      }
+    }
+    if (!restricted) {
+      // Fallback: leave it open to all assemblies rather than saving a BOM
+      // that is available to none, which would fail the item-side assignment.
+      bom.setValue({ fieldId: 'availableforallassemblies', value: true });
+      log.audit('BOM "' + name + '" saved as available-for-all-assemblies',
+                'restricttoassemblies could not be set; assignment would otherwise fail.');
+    }
+
     return bom.save({ ignoreMandatoryFields: true });
+  };
+
+  /** Find a BOM by exact name, or null. Used to recover from partial runs. */
+  const findBomByName = (name) => {
+    try {
+      const r = query.runSuiteQL({
+        query: 'SELECT id FROM bom WHERE UPPER(name) = ? AND ROWNUM <= 1',
+        params: [String(name).toUpperCase()]
+      }).asMappedResults();
+      return r.length ? Number(r[0].id) : null;
+    } catch (e) {
+      log.audit('BOM name lookup failed for "' + name + '"', e.message);
+      return null;
+    }
   };
 
   /** Read the subsidiary list off an existing BOM record. */
@@ -306,9 +374,26 @@ define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
 
   /** Copy every component of an existing revision onto a new BOM, verbatim. */
   const cloneRevision = (srcRev, targetBomId) => {
+    const revName = srcRev.getValue({ fieldId: 'name' });
+
+    // If a prior attempt already cloned this revision onto this BOM, reuse it
+    // rather than creating a duplicate.
+    try {
+      const dupe = query.runSuiteQL({
+        query: 'SELECT id FROM bomrevision WHERE billofmaterials = ? AND UPPER(name) = ? AND ROWNUM <= 1',
+        params: [targetBomId, String(revName).toUpperCase()]
+      }).asMappedResults();
+      if (dupe.length) {
+        log.audit('Reusing existing revision ' + dupe[0].id + ' on BOM ' + targetBomId, revName);
+        return Number(dupe[0].id);
+      }
+    } catch (e) {
+      log.audit('Revision dupe check skipped', e.message);
+    }
+
     const rev = record.create({ type: record.Type.BOM_REVISION, isDynamic: false });
     rev.setValue({ fieldId: 'billofmaterials', value: targetBomId });
-    rev.setValue({ fieldId: 'name', value: srcRev.getValue({ fieldId: 'name' }) });
+    rev.setValue({ fieldId: 'name', value: revName });
     rev.setValue({ fieldId: 'effectivestartdate',
                    value: srcRev.getValue({ fieldId: 'effectivestartdate' }) });
     // deliberately no end date -- the child BOM is the live one going forward
@@ -361,18 +446,46 @@ define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
     return m ? m[1] : 'A';
   };
 
-  /** Point an assembly item at exactly one BOM, as master default. */
+  /**
+   * Point an assembly item at exactly one BOM, as master default.
+   *
+   * If NetSuite rejects the BOM with INVALID_FLD_VALUE, the cause is almost
+   * always that the BOM is not available to this assembly. Rather than fail
+   * the part, open the BOM up to all assemblies and retry once -- the
+   * assignment itself is what matters, and an over-broad availability flag is
+   * a far smaller problem than a half-split part.
+   */
   const replaceBoms = (itemId, bomId) => {
-    const item = record.load({ type: record.Type.ASSEMBLY_ITEM, id: itemId, isDynamic: true });
-    const s = 'billofmaterials';
-    for (let i = item.getLineCount({ sublistId: s }) - 1; i >= 0; i--) {
-      item.removeLine({ sublistId: s, line: i });
+    const doAssign = () => {
+      const item = record.load({ type: record.Type.ASSEMBLY_ITEM, id: itemId, isDynamic: true });
+      const s = 'billofmaterials';
+      for (let i = item.getLineCount({ sublistId: s }) - 1; i >= 0; i--) {
+        item.removeLine({ sublistId: s, line: i });
+      }
+      item.selectNewLine({ sublistId: s });
+      item.setCurrentSublistValue({ sublistId: s, fieldId: 'billofmaterials', value: bomId });
+      item.setCurrentSublistValue({ sublistId: s, fieldId: 'masterdefault', value: true });
+      item.commitLine({ sublistId: s });
+      item.save({ ignoreMandatoryFields: true });
+    };
+
+    try {
+      doAssign();
+    } catch (e) {
+      log.audit('BOM ' + bomId + ' rejected on item ' + itemId + '; opening availability and retrying',
+                e.message);
+      try {
+        record.submitFields({
+          type: record.Type.BOM,
+          id: bomId,
+          values: { availableforallassemblies: true },
+          options: { ignoreMandatoryFields: true }
+        });
+      } catch (e2) {
+        log.error('Could not open BOM ' + bomId + ' to all assemblies', e2.message);
+      }
+      doAssign();   // let it throw this time if it still fails
     }
-    item.selectNewLine({ sublistId: s });
-    item.setCurrentSublistValue({ sublistId: s, fieldId: 'billofmaterials', value: bomId });
-    item.setCurrentSublistValue({ sublistId: s, fieldId: 'masterdefault', value: true });
-    item.commitLine({ sublistId: s });
-    item.save({ ignoreMandatoryFields: true });
   };
 
   const attachBom = (itemId, bomId, asMasterDefault) => {
