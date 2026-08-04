@@ -1,512 +1,546 @@
 /**
- * GYH_PowderSplit_MR.js
+ * GYH_PowderSplit_SL.js
  *
- * Companion processor for GYH_PowderSplit_SL.js. All record writes happen
- * here so a batch of parts does not blow the 1,000-unit Suitelet governance
- * ceiling.
+ * GEN-Y HITCH - Add Powder Coat Step to Parts
+ * -------------------------------------------
+ * Suitelet UI. Takes a list of part numbers + color + hanger qty, validates
+ * everything read-only, then hands the write work to GYH_PowderSplit_MR.js.
  *
- * Modeled directly on the 101798 cutover done in PROD on 08/04/2026:
+ * Follows the 101798 cutover pattern (PROD, 08/04/2026):
  *
- *   item 8641   101798        -> renamed  101798 - SV   (+ " SILVER VEIN" on
- *                                the display name).  Keeps its internal ID,
- *                                so inventory / history / where-used stay put.
- *   item 28530  101798        -> new copy, the bare child.
+ *   ITEM   101798  is renamed to  101798 - SV  and gains " SILVER VEIN" on its
+ *          display name. Same internal ID, so inventory, transaction history,
+ *          where-used, open POs and SOs all stay attached to it. It is now the
+ *          coated finished good.
+ *   ITEM   a copy is created under the original number 101798 -- the bare
+ *          child, starting at zero on hand.
+ *   BOM    the existing BOM record is RENAMED to "101798 - SV BOM" and stays
+ *          on the parent, so historical WOs still resolve to the BOM they were
+ *          built against. Its live revision is end-dated and a new revision
+ *          "101798 - SV BOM REV <letter>" is added:
+ *              101798                                     x 1    WORK_ORDER
+ *              PRIME AND POWDER COAT <color> (PER HANGER)  x n    PHANTOM
+ *   BOM    a NEW BOM "101798 BOM" is created for the child, holding a clone of
+ *          the last fab revision -- same revision name, original effective
+ *          start date, no end date.
+ *   ROUTE  the live fab routing is REPOINTED from the parent BOM to the child
+ *          BOM (same record, same name, same steps). Inactive "-TECH_ONLY"
+ *          routings on subsidiary 4 are left alone.
+ *   ROUTE  a NEW routing "101798 - SV ROUTING" is created on the parent BOM
+ *          with a single op: seq 9, POWDERCOAT, Hitch - Powder Coating,
+ *          PRIME AND POWDER-COAT (COST PER HANGER).
  *
- *   bom 1072    101798 BOM    -> RENAMED to 101798 - SV BOM. Stays on the
- *                                parent, so historical WOs still resolve to
- *                                the BOM record they were built against.
- *      rev 1320  101798 REV F        end-dated 08/02/2026 (left as history)
- *      rev 12790 101798 - SV BOM REV F   NEW, eff 08/03/2026:
- *                                    101798                    x1   WORK_ORDER
- *                                    PRIME AND POWDER COAT ... x1   PHANTOM
- *
- *   bom 10955   101798 BOM    -> NEW BOM for the child, holding a clone of
- *      rev 12789 101798 REV F      the last fab revision, same name, original
- *                                  11/01/2023 start date, no end date.
- *
- *   routing 3709 101798 Routing  -> REPOINTED from bom 1072 to bom 10955.
- *                                   Same name, same steps, same history.
- *   routing 10248 101798 - SV ROUTING -> NEW on bom 1072, one op:
- *                                   seq 9  POWDERCOAT  Hitch - Powder Coating
- *                                   PRIME AND POWDER-COAT (COST PER HANGER)
- *                                   run rate 0.5
- *   routing 878  101798 Routing-TECH_ONLY -> untouched (inactive, sub 4).
- *
- * The phantom BOM qty on 101798 rev 12790 was entered as 1 but should have
- * been 0.5 to match the run rate. Hangers and run rate are the same number by
- * definition, so this script derives both from a single input and cannot
- * reproduce that drift. 125 already-split parts in PROD have the mismatch.
- *
- * BUGFIX (08/2026): the child's new BOM must be created AFTER the fab BOM is
- * renamed off the "<origName> BOM" name, not before -- that name still
- * belongs to the (as-yet unrenamed) fab BOM at the point the old code tried
- * to reuse it, so createBom() collided with it on every single part. Fixed
- * by renaming the fab BOM first, which frees the name for the child's clone.
- *
- * RESUME SUPPORT: if a run dies after the rename+copy step but before the
- * BOM/routing rebuild (exactly what the ordering bug above caused), the item
- * split is already done and safe -- record.copy() carries the original BOM
- * assignment onto the child as a side effect, so both items still point at
- * the same untouched BOM/routing until the rebuild finishes. row.resume=true
- * skips the rename+copy and picks up directly at the BOM/routing rebuild
- * using row.parentInternalId (the already-renamed parent) and
- * row.itemInternalId (the already-created child).
+ * UI: built as an N/ui/serverWidget Form with a single INLINEHTML field
+ * carrying the whole dashboard (markup + scoped CSS + JS), rendered via
+ * response.writePage(). Nothing is written to the response as raw HTML.
  *
  * @NApiVersion 2.1
- * @NScriptType MapReduceScript
+ * @NScriptType Suitelet
  * @NModuleScope SameAccount
  */
-define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
-(record, query, runtime, log, format, email) => {
+define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
+(serverWidget, query, task, runtime, log) => {
 
   // ---------------------------------------------------------------- config
-  // Verified against PROD account 5262266 on 2026-08-04.
   const CFG = {
-    PARAM: 'custscriptgyh_pcs_payload',  // confirmed on the Deployment Parameters tab in SB2 08/2026
+    SUFFIX: ' - SV',                       // exactly as used in PROD
+    PHANTOM_PREFIX: 'PRIME AND POWDER',
+    DEFAULT_HANGERS: 0.5,
+    // Hanger qty drives BOTH the phantom BOM quantity and the routing run
+    // rate. They are the same number by definition -- one hanger of capacity
+    // consumed per hanger of powder. Keeping them as one field is what stops
+    // the 1-vs-0.5 drift found on 125 already-split parts.
+    SUBSIDIARY: 2,
+    MAX_ROWS: 100,
 
-    PC_OP_NAME: 'POWDERCOAT',   // 101798 used one word; older parts used "POWDER COAT"
-    PC_OP_SEQ: 9,
-    PC_WORKCENTER: 948410,      // entitygroup "Hitch - Powder Coating"
-    PC_COST_TEMPLATE: 38,       // "PRIME AND POWDER-COAT (COST PER HANGER)"
-    PC_SETUP_TIME: 0,
+    WRAPPER_ID: 'gyhPowderSplit',          // every custom CSS/JS rule is scoped under this
 
-    SUBSIDIARY: 2,              // GEN-Y HITCH
-    LOCATION: 1,                // Hitch
-    COST_ESTIMATE_TYPE: 'AVGCOST',
-
-    CHILD_ITEM_SOURCE: 'WORK_ORDER',
-    PHANTOM_ITEM_SOURCE: 'PHANTOM',
-
-    EMAIL_SUMMARY: true
+    MR_SCRIPT_ID: 'customscript5496',      // confirmed on the Script record in SB2 08/2026
+    MR_DEPLOY_ID: 'customdeploy1',         // confirmed on the Deployment record in SB2 08/2026
+    MR_PARAM: 'custscriptgyh_pcs_payload'  // confirmed on the Deployment Parameters tab in SB2 08/2026
   };
 
-  // ------------------------------------------------------------------ input
-  const getInputData = () => {
-    const raw = runtime.getCurrentScript().getParameter({ name: CFG.PARAM });
-    if (!raw) throw new Error('No payload on ' + CFG.PARAM + '. Launch this from the Suitelet.');
-    const rows = JSON.parse(raw);
-    log.audit('Powder split starting', rows.length + ' part(s)');
-    return rows;
-  };
+  // ------------------------------------------------------------ entry point
+  const onRequest = (ctx) => {
+    const req = ctx.request, res = ctx.response;
 
-  // -------------------------------------------------------------------- map
-  const map = (ctx) => {
-    const row = JSON.parse(ctx.value);
-    const result = { partNumber: row.partNumber, ok: false, created: {}, error: null, notes: [] };
+    if (req.method === 'GET') { res.writePage(buildForm()); return; }
+
+    res.setHeader({ name: 'Content-Type', value: 'application/json' });
+    let out;
     try {
-      splitPart(row, result);
-      result.ok = true;
-      log.audit('Split OK: ' + row.partNumber, result.created);
+      const body = JSON.parse(req.body || '{}');
+      if (body.action === 'validate') out = { ok: true, rows: validateRows(body.rows || [], body.cutoverDate) };
+      else if (body.action === 'commit') out = commit(body.rows || [], body.cutoverDate);
+      else out = { ok: false, error: 'Unknown action' };
     } catch (e) {
-      result.error = e.message || String(e);
-      log.error('Split FAILED: ' + row.partNumber, e);
+      log.error('POST failed', e);
+      out = { ok: false, error: e.message || String(e) };
     }
-    ctx.write({ key: row.partNumber, value: JSON.stringify(result) });
+    res.write(JSON.stringify(out));
   };
 
-  // ------------------------------------------------------------------- work
-  const splitPart = (row, result) => {
-    const origName   = String(row.partNumber).trim();
-    const parentName = String(row.parentName).trim();
-    const phantomId  = Number(row.phantomItemId);
-    const colorLabel = String(row.colorLabel || '').trim();
-    const hangers    = Number(row.hangers);
-    const runRate    = hangers;   // same number by definition -- see header note
-    const fabBomId   = row.fabBomId ? Number(row.fabBomId) : null;
-    const resume     = !!row.resume;
+  // ---------------------------------------------------------- form / widget
+  const buildForm = () => {
+    const form = serverWidget.createForm({ title: 'Add Powder Coat Step to Parts' });
 
-    const cutover = parseDate(row.cutoverDate);          // new parent rev starts here
-    const dayBefore = addDays(cutover, -1);              // old fab rev ends here
-
-    let origId, childId, baseDisplay;
-
-    if (resume) {
-      // A prior attempt already renamed the parent and copied out the child
-      // (record.copy() carries the original BOM assignment over as a side
-      // effect, so both items still safely share the old, untouched BOM at
-      // this point -- nothing is broken, just unfinished). Pick up from
-      // there instead of renaming/copying again.
-      origId = Number(row.parentInternalId);
-      childId = Number(row.itemInternalId);
-      const parentRec = record.load({ type: record.Type.ASSEMBLY_ITEM, id: origId, isDynamic: false });
-      baseDisplay = String(parentRec.getValue({ fieldId: 'displayname' }) || '')
-        .replace(new RegExp('\\s*' + colorLabel + '\\s*$', 'i'), '').trim();
-      result.created.parentId = origId;
-      result.created.parentName = parentName;
-      result.created.childId = childId;
-      result.created.childName = origName;
-      result.notes.push('Resumed a prior attempt: item rename and child copy were already done; ' +
-                        'only the BOM/routing rebuild ran this time.');
-    } else {
-      origId = Number(row.itemInternalId);
-
-      // ------------------------------------------------ 1. rename the original
-      const parent = record.load({ type: record.Type.ASSEMBLY_ITEM, id: origId, isDynamic: false });
-      baseDisplay = String(parent.getValue({ fieldId: 'displayname' }) || '').trim();
-      parent.setValue({ fieldId: 'itemid', value: parentName });
-      if (colorLabel && baseDisplay.toUpperCase().indexOf(colorLabel.toUpperCase()) === -1) {
-        parent.setValue({ fieldId: 'displayname', value: (baseDisplay + ' ' + colorLabel).trim() });
-      }
-      parent.setValue({ fieldId: 'costestimatetype', value: CFG.COST_ESTIMATE_TYPE });
-      parent.save({ ignoreMandatoryFields: true });
-      result.created.parentId = origId;
-      result.created.parentName = parentName;
-
-      // -------------------------------------------- 2. copy out the bare child
-      const child = record.copy({ type: record.Type.ASSEMBLY_ITEM, id: origId, isDynamic: false });
-      child.setValue({ fieldId: 'itemid', value: origName });
-      child.setValue({ fieldId: 'displayname', value: baseDisplay });   // color-free
-      child.setValue({ fieldId: 'costestimatetype', value: CFG.COST_ESTIMATE_TYPE });
-      adjustChild(child);
-      childId = child.save({ ignoreMandatoryFields: true });
-      result.created.childId = childId;
-      result.created.childName = origName;
-    }
-
-    if (!fabBomId) {
-      result.notes.push('No master-default BOM on the original item. No child BOM built and ' +
-                        'no routing repointed -- the powder BOM/routing below is all that was made.');
-    }
-
-    // ------------------------- 3. rename the fab BOM out of the way FIRST --
-    //    it currently still holds the name "<origName> BOM" (e.g. "101320
-    //    BOM"), which is exactly the name the child's new BOM needs below.
-    //    Renaming this one to the parent name frees that name up. Doing
-    //    this step AFTER creating the child's BOM (the old order) collided
-    //    with this record's own pre-existing name on every single part.
-    let childBomId = null;
-    if (fabBomId) {
-      const fabRevId = row.fabRevId ? Number(row.fabRevId) : getCurrentRevision(fabBomId, origId);
-      if (!fabRevId) throw new Error('Could not resolve the current revision on BOM ' + fabBomId + '.');
-
-      const srcRev = record.load({ type: record.Type.BOM_REVISION, id: fabRevId, isDynamic: false });
-      const srcRevName = srcRev.getValue({ fieldId: 'name' });
-
-      const bom = record.load({ type: record.Type.BOM, id: fabBomId, isDynamic: false });
-      const fabSubs = getBomSubsidiaries(fabBomId);
-      const alreadyRenamed = String(bom.getValue({ fieldId: 'name' })) === (parentName + ' BOM');
-      if (!alreadyRenamed) {
-        bom.setValue({ fieldId: 'name', value: parentName + ' BOM' });
-        bom.save({ ignoreMandatoryFields: true });
-      }
-      result.created.parentBomId = fabBomId;
-
-      // ------------------------- 4. now the original name is free: give the
-      //    child its own clone of the fab revision under that name.
-      childBomId = createBom(origName + ' BOM', fabSubs);
-      result.created.childBomId = childBomId;
-      result.created.childRevisionId = cloneRevision(srcRev, childBomId);
-
-      // the copy inherited the parent's BOM line -- swap it for the new one
-      replaceBoms(childId, childBomId);
-
-      // ----------------------- 5. repoint the live fab routing to that BOM
-      const moved = repointRoutings(fabBomId, childBomId);
-      result.created.routingsRepointed = moved;
-      if (!moved.length) {
-        result.notes.push('No active subsidiary-' + CFG.SUBSIDIARY + ' routing was on BOM ' +
-                          fabBomId + ', so nothing was repointed to the child.');
-      }
-
-      // ------------------- 6. close the old rev, add the powder rev
-      const revAlreadyEndDated = !!srcRev.getValue({ fieldId: 'effectiveenddate' });
-      if (!revAlreadyEndDated) endDateRevision(fabRevId, dayBefore);
-
-      const letter = revisionLetter(srcRevName);
-      result.created.parentRevisionId = createPowderRevision(
-        fabBomId, parentName + ' BOM REV ' + letter, cutover, childId, phantomId, hangers
-      );
-      result.created.parentRevisionName = parentName + ' BOM REV ' + letter;
-
-      // ---------------------------------- 7. powder routing on the same BOM
-      result.created.routingId = createRouting(parentName, fabBomId, runRate);
-
-    } else {
-      // No pre-existing BOM: build the powder BOM from scratch on the parent.
-      // No source BOM to inherit from, so mirror the item's own subsidiaries.
-      let itemSubs = null;
-      try {
-        const it = record.load({ type: record.Type.ASSEMBLY_ITEM, id: origId, isDynamic: false });
-        const v = it.getValue({ fieldId: 'subsidiary' });
-        itemSubs = Array.isArray(v) ? v
-          : (v ? String(v).split(',').map((s) => s.trim()).filter((s) => s) : null);
-      } catch (e) {
-        log.audit('Could not read subsidiaries off item ' + origId, e.message);
-      }
-      const bomId = createBom(parentName + ' BOM', itemSubs);
-      result.created.parentBomId = bomId;
-      result.created.parentRevisionName = parentName + ' BOM REV A';
-      result.created.parentRevisionId = createPowderRevision(
-        bomId, parentName + ' BOM REV A', cutover, childId, phantomId, hangers
-      );
-      attachBom(origId, bomId, true);
-      result.created.routingId = createRouting(parentName, bomId, runRate);
-    }
-  };
-
-  /**
-   * Hook for anything the bare child should NOT inherit from the copy.
-   * It is an internal WIP part, so it usually should not be sellable or
-   * carry the parent's sales pricing.
-   */
-  const adjustChild = (child) => {
-    try {
-      // child.setValue({ fieldId: 'isonline', value: false });
-      // child.setValue({ fieldId: 'salesdescription', value: '' });
-      // child.setValue({ fieldId: 'upccode', value: '' });
-    } catch (e) {
-      log.audit('adjustChild skipped a field', e.message);
-    }
-  };
-
-  // ----------------------------------------------------------- BOM plumbing
-  const getCurrentRevision = (bomId, itemId) => {
-    const r = query.runSuiteQL({
-      query: 'SELECT currentrevision FROM itemAssemblyItemBom ' +
-             'WHERE billofmaterials = ? AND assembly = ?',
-      params: [bomId, itemId]
-    }).asMappedResults();
-    return r.length && r[0].currentrevision ? Number(r[0].currentrevision) : null;
-  };
-
-  /**
-   * Create a BOM. `subsidiaries` should be the subsidiary list read off the
-   * BOM being cloned -- these items commonly sit on BOTH GEN-Y HITCH (2) and
-   * GEN-Y TECH (4), and every fab BOM checked in PROD and SB2 carries "2, 4".
-   * Hardcoding just CFG.SUBSIDIARY would create the child BOM narrower than
-   * the parent it was cloned from and break it for TECH-side activity.
-   */
-  const createBom = (name, subsidiaries) => {
-    const bom = record.create({ type: record.Type.BOM, isDynamic: false });
-    bom.setValue({ fieldId: 'name', value: name });
-    bom.setValue({ fieldId: 'includechildren', value: false });
-    bom.setValue({ fieldId: 'usecomponentyield', value: false });
-    bom.setValue({ fieldId: 'availableforallassemblies', value: false });
-    bom.setValue({ fieldId: 'availableforalllocations', value: true });  // must be T
-    bom.setValue({
-      fieldId: 'subsidiary',
-      value: (subsidiaries && subsidiaries.length) ? subsidiaries : [CFG.SUBSIDIARY]
+    const field = form.addField({
+      id: 'custpage_gyh_powdersplit_html',
+      type: serverWidget.FieldType.INLINEHTML,
+      label: 'Dashboard'
     });
-    return bom.save({ ignoreMandatoryFields: true });
+    field.updateLayoutType({ layoutType: serverWidget.FieldLayoutType.OUTSIDEBELOW });
+    field.updateBreakType({ breakType: serverWidget.FieldBreakType.STARTROW });
+    field.defaultValue = renderPage();
+
+    return form;
   };
 
-  /** Read the subsidiary list off an existing BOM record. */
-  const getBomSubsidiaries = (bomId) => {
-    try {
-      const bom = record.load({ type: record.Type.BOM, id: bomId, isDynamic: false });
-      const v = bom.getValue({ fieldId: 'subsidiary' });
-      if (Array.isArray(v)) return v;
-      if (v === null || v === '') return null;
-      return String(v).split(',').map((s) => s.trim()).filter((s) => s);
-    } catch (e) {
-      log.audit('Could not read subsidiaries off BOM ' + bomId, e.message);
-      return null;
-    }
-  };
+  // ------------------------------------------------------------- validation
+  const validateRows = (rows, cutoverDate) => {
+    rows = rows.slice(0, CFG.MAX_ROWS);
+    if (!rows.length) return [];
 
-  /** Copy every component of an existing revision onto a new BOM, verbatim. */
-  const cloneRevision = (srcRev, targetBomId) => {
-    const rev = record.create({ type: record.Type.BOM_REVISION, isDynamic: false });
-    rev.setValue({ fieldId: 'billofmaterials', value: targetBomId });
-    rev.setValue({ fieldId: 'name', value: srcRev.getValue({ fieldId: 'name' }) });
-    rev.setValue({ fieldId: 'effectivestartdate',
-                   value: srcRev.getValue({ fieldId: 'effectivestartdate' }) });
-    // deliberately no end date -- the child BOM is the live one going forward
+    // look up the part and its future " - SV" name, to catch re-runs
+    const names = [];
+    rows.forEach((r) => {
+      const p = String(r.partNumber || '').trim();
+      if (p) { names.push(p.toUpperCase()); names.push((p + CFG.SUFFIX).toUpperCase()); }
+    });
 
-    const s = 'component';
-    const n = srcRev.getLineCount({ sublistId: s });
-    if (!n) throw new Error('Source revision ' + srcRev.id + ' has no components.');
-
-    for (let i = 0; i < n; i++) {
-      ['item', 'bomquantity', 'componentyield', 'itemsource', 'units', 'description'].forEach((f) => {
-        try {
-          const v = srcRev.getSublistValue({ sublistId: s, fieldId: f, line: i });
-          if (v !== null && v !== '') {
-            rev.setSublistValue({ sublistId: s, fieldId: f, line: i, value: v });
-          }
-        } catch (e) { /* field not on this account's form */ }
+    const itemsByName = {}, itemsById = {};
+    if (names.length) {
+      const ph = names.map(() => '?').join(',');
+      query.runSuiteQL({
+        query: 'SELECT id, itemid, displayname, itemtype, isinactive, costestimatetype ' +
+               'FROM item WHERE UPPER(itemid) IN (' + ph + ')',
+        params: names
+      }).asMappedResults().forEach((i) => {
+        itemsByName[String(i.itemid).trim().toUpperCase()] = i;
+        itemsById[String(i.id)] = i;
       });
     }
-    return rev.save({ ignoreMandatoryFields: true });
+
+    const ids = Object.keys(itemsById);
+
+    // master-default BOM + its current revision
+    const bomByItem = {};
+    if (ids.length) {
+      const ph = ids.map(() => '?').join(',');
+      try {
+        query.runSuiteQL({
+          query: 'SELECT ab.assembly, ab.billofmaterials, b.name AS bomname, ' +
+                 'ab.currentrevision, r.name AS revname, r.effectivestartdate ' +
+                 'FROM itemAssemblyItemBom ab ' +
+                 'JOIN bom b ON b.id = ab.billofmaterials ' +
+                 'LEFT JOIN bomrevision r ON r.id = ab.currentrevision ' +
+                 "WHERE ab.masterdefault = 'T' AND ab.assembly IN (" + ph + ')',
+          params: ids
+        }).asMappedResults().forEach((b) => { bomByItem[String(b.assembly)] = b; });
+      } catch (e) {
+        log.audit('BOM lookup skipped', e.message);
+      }
+    }
+
+    // live routings that will be repointed to the child BOM
+    const routingsByBom = {};
+    const bomIds = Object.keys(bomByItem).map((k) => bomByItem[k].billofmaterials);
+    if (bomIds.length) {
+      const ph = bomIds.map(() => '?').join(',');
+      try {
+        query.runSuiteQL({
+          query: 'SELECT billofmaterials, id, name FROM manufacturingrouting ' +
+                 "WHERE isinactive = 'F' AND subsidiary = " + CFG.SUBSIDIARY +
+                 ' AND billofmaterials IN (' + ph + ')',
+          params: bomIds
+        }).asMappedResults().forEach((r) => {
+          const k = String(r.billofmaterials);
+          (routingsByBom[k] = routingsByBom[k] || []).push(r.name);
+        });
+      } catch (e) {
+        log.audit('Routing lookup skipped', e.message);
+      }
+    }
+
+    // open WOs -> warning only
+    const openWoByItem = {};
+    if (ids.length) {
+      const ph = ids.map(() => '?').join(',');
+      try {
+        query.runSuiteQL({
+          query: 'SELECT tl.item, COUNT(*) AS cnt FROM transaction t ' +
+                 'JOIN transactionline tl ON tl.transaction = t.id ' +
+                 "WHERE t.type = 'WorkOrd' AND t.status NOT IN ('WorkOrd:G','WorkOrd:H') " +
+                 "AND tl.mainline = 'T' AND tl.item IN (" + ph + ') GROUP BY tl.item',
+          params: ids
+        }).asMappedResults().forEach((w) => { openWoByItem[String(w.item)] = Number(w.cnt); });
+      } catch (e) {
+        log.audit('Open WO lookup skipped', e.message);
+      }
+    }
+
+    const colorIds = {};
+    getColors().forEach((c) => { colorIds[String(c.id)] = c; });
+
+    return rows.map((r) => {
+      const part = String(r.partNumber || '').trim();
+      const color = colorIds[String(r.phantomItemId)];
+      const out = {
+        partNumber: part,
+        parentName: part + CFG.SUFFIX,
+        phantomItemId: r.phantomItemId,
+        colorLabel: color ? colorLabel(color.itemid) : '',
+        hangers: Number(r.hangers) || CFG.DEFAULT_HANGERS,
+        cutoverDate: cutoverDate || '',
+        itemInternalId: null,
+        fabBomId: null, fabBomName: null, fabRevId: null, fabRevName: null,
+        newRevName: null, routings: [],
+        status: 'ok', messages: []
+      };
+      const err = (m) => { out.status = 'error'; out.messages.push(m); };
+      const warn = (m) => { if (out.status !== 'error') out.status = 'warn'; out.messages.push(m); };
+
+      if (!part) { err('Part number is blank.'); return out; }
+
+      const item = itemsByName[part.toUpperCase()];
+      if (!item) { err('No item found with this name/number.'); return out; }
+      out.itemInternalId = item.id;
+
+      if (String(item.itemtype) !== 'Assembly') {
+        err('Item type is ' + item.itemtype + '. Only Assembly items can be split.');
+      }
+      if (String(item.isinactive) === 'T') err('Item is inactive.');
+      if (part.toUpperCase().endsWith(CFG.SUFFIX.trim().toUpperCase())) {
+        err('Already ends in "' + CFG.SUFFIX.trim() + '" -- looks like it was split already.');
+      }
+
+      const clash = itemsByName[out.parentName.toUpperCase()];
+      const childBom = bomByItem[String(item.id)];
+      const parentBom = clash ? bomByItem[String(clash.id)] : null;
+      // A parent-name clash usually means it's already split -- but if the
+      // "child" we resolved above and the existing "- SV" parent still
+      // share the exact same master-default BOM, that's not a real
+      // conflict: it's a prior attempt that renamed + copied successfully
+      // but died before the BOM/routing rebuild (record.copy() carries the
+      // BOM assignment over, so both sides point at the same untouched BOM
+      // until that rebuild finishes). That state is safe to resume.
+      const resumable = clash && parentBom && childBom &&
+        String(parentBom.billofmaterials) === String(childBom.billofmaterials);
+
+      if (clash && !resumable) {
+        err('"' + out.parentName + '" already exists (internal ID ' + clash.id + ').');
+      } else if (resumable) {
+        out.resume = true;
+        out.parentInternalId = clash.id;
+        warn('"' + out.parentName + '" (internal ID ' + clash.id + ') already exists and still shares ' +
+             'its BOM with this item -- looks like a prior attempt died mid-way. This run will pick up ' +
+             'at the BOM/routing rebuild and skip renaming or copying again.');
+      }
+
+      const bom = resumable ? parentBom : childBom;
+      if (bom) {
+        out.fabBomId = bom.billofmaterials;
+        out.fabBomName = bom.bomname;
+        out.fabRevId = bom.currentrevision;
+        out.fabRevName = bom.revname;
+        out.newRevName = out.parentName + ' BOM REV ' + revLetter(bom.revname);
+        out.routings = routingsByBom[String(bom.billofmaterials)] || [];
+        if (!bom.currentrevision) err('BOM "' + bom.bomname + '" has no current revision to clone.');
+        if (!out.routings.length) {
+          warn('No active subsidiary-' + CFG.SUBSIDIARY + ' routing on this BOM, so nothing will be repointed.');
+        }
+      } else {
+        warn('No master-default BOM. A powder BOM will be built from scratch and the child will have none.');
+      }
+
+      if (!color) err('Pick a color.');
+      if (!(out.hangers > 0)) err('Hanger qty must be greater than zero.');
+
+      const wo = openWoByItem[String(item.id)];
+      if (wo) warn(wo + ' open WO(s) on this item -- travelers already printed will show the old number.');
+
+      return out;
+    });
   };
 
-  const endDateRevision = (revId, endDate) => {
-    const rev = record.load({ type: record.Type.BOM_REVISION, id: revId, isDynamic: false });
-    rev.setValue({ fieldId: 'effectiveenddate', value: endDate });
-    rev.save({ ignoreMandatoryFields: true });
+  // ----------------------------------------------------------------- commit
+  const commit = (rows, cutoverDate) => {
+    const validated = validateRows(rows, cutoverDate);
+    const bad = validated.filter((r) => r.status === 'error');
+    if (bad.length) return { ok: false, error: bad.length + ' row(s) still have errors. Re-validate.' };
+    if (!validated.length) return { ok: false, error: 'Nothing to process.' };
+
+    const payload = validated.map((r) => ({
+      partNumber: r.partNumber,
+      itemInternalId: r.itemInternalId,
+      parentInternalId: r.parentInternalId || null,
+      resume: !!r.resume,
+      parentName: r.parentName,
+      phantomItemId: r.phantomItemId,
+      colorLabel: r.colorLabel,
+      hangers: r.hangers,          // MR uses this for BOM qty and run rate alike
+      fabBomId: r.fabBomId,
+      fabRevId: r.fabRevId,
+      cutoverDate: cutoverDate || ''
+    }));
+
+    const t = task.create({ taskType: task.TaskType.MAP_REDUCE });
+    t.scriptId = CFG.MR_SCRIPT_ID;
+    t.deploymentId = CFG.MR_DEPLOY_ID;
+    t.params = {};
+    t.params[CFG.MR_PARAM] = JSON.stringify(payload);
+
+    const taskId = t.submit();
+    log.audit('Powder split queued', { taskId: taskId, count: payload.length, user: runtime.getCurrentUser().id });
+    return { ok: true, taskId: taskId, count: payload.length };
   };
 
-  const createPowderRevision = (bomId, revName, startDate, childId, phantomId, hangers) => {
-    const rev = record.create({ type: record.Type.BOM_REVISION, isDynamic: false });
-    rev.setValue({ fieldId: 'billofmaterials', value: bomId });
-    rev.setValue({ fieldId: 'name', value: revName });
-    rev.setValue({ fieldId: 'effectivestartdate', value: startDate });
-
-    setComponent(rev, 0, childId, 1, CFG.CHILD_ITEM_SOURCE);
-    setComponent(rev, 1, phantomId, hangers, CFG.PHANTOM_ITEM_SOURCE);
-
-    return rev.save({ ignoreMandatoryFields: true });
+  // ----------------------------------------------------------------- colors
+  const getColors = () => {
+    try {
+      return query.runSuiteQL({
+        query: 'SELECT id, itemid, displayname FROM item ' +
+               "WHERE UPPER(itemid) LIKE ? AND isinactive = 'F' AND itemtype = 'Assembly' " +
+               'ORDER BY itemid',
+        params: [CFG.PHANTOM_PREFIX + '%']
+      }).asMappedResults();
+    } catch (e) {
+      log.error('Color lookup failed', e);
+      return [];
+    }
   };
 
-  const setComponent = (rev, line, itemId, qty, source) => {
-    const s = 'component';
-    rev.setSublistValue({ sublistId: s, fieldId: 'item', line: line, value: itemId });
-    rev.setSublistValue({ sublistId: s, fieldId: 'bomquantity', line: line, value: qty });
-    rev.setSublistValue({ sublistId: s, fieldId: 'itemsource', line: line, value: source });
-  };
+  /** "PRIME AND POWDER COAT SILVER VEIN (PER HANGER)" -> "SILVER VEIN" */
+  const colorLabel = (itemid) => String(itemid || '')
+    .toUpperCase()
+    .replace(/^PRIME\s+AND\s+POWDER\s*-?\s*COAT\s*/, '')
+    .replace(/\(PER\s+HANGER\)/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 
-  /** Strip everything down to the trailing revision letter: "101798 REV F" -> "F". */
-  const revisionLetter = (revName) => {
-    const m = String(revName || '').toUpperCase().match(/REV\s*[-]?\s*([A-Z0-9]{1,3})\s*$/);
+  /** "101798 REV F" -> "F" */
+  const revLetter = (revName) => {
+    const m = String(revName || '').toUpperCase().match(/REV\s*-?\s*([A-Z0-9]{1,3})\s*$/);
     return m ? m[1] : 'A';
   };
 
-  /** Point an assembly item at exactly one BOM, as master default. */
-  const replaceBoms = (itemId, bomId) => {
-    const item = record.load({ type: record.Type.ASSEMBLY_ITEM, id: itemId, isDynamic: true });
-    const s = 'billofmaterials';
-    for (let i = item.getLineCount({ sublistId: s }) - 1; i >= 0; i--) {
-      item.removeLine({ sublistId: s, line: i });
-    }
-    item.selectNewLine({ sublistId: s });
-    item.setCurrentSublistValue({ sublistId: s, fieldId: 'billofmaterials', value: bomId });
-    item.setCurrentSublistValue({ sublistId: s, fieldId: 'masterdefault', value: true });
-    item.commitLine({ sublistId: s });
-    item.save({ ignoreMandatoryFields: true });
+  // ------------------------------------------------------------------- view
+  // Returns ONLY the scoped fragment that goes into the INLINEHTML field --
+  // no <html>/<head>/<body>. Everything is nested inside #WRAPPER_ID so the
+  // CSS/JS can't touch anything outside it, and the only thing reaching
+  // outside that div is the one rule that hides NetSuite's own title band.
+  const renderPage = () => {
+    const colors = getColors().map((c) => ({ id: c.id, label: c.itemid }));
+    const W = CFG.WRAPPER_ID;
+
+    return '<style>' + css(W) + '</style>' +
+      '<div id="' + W + '">' +
+        '<header><h1>Add Powder Coat Step to Parts</h1>' +
+        '<p class="sub">Renames each part to <code>&lt;part&gt;' + esc(CFG.SUFFIX) + '</code> as the ' +
+        'coated parent, copies it back out under the original number as the bare child, then rebuilds ' +
+        'the BOMs and routings the same way 101798 was done.</p></header>' +
+
+        '<section class="card">' +
+          '<h2>1 &middot; Load part numbers</h2>' +
+          '<div class="bulk">' +
+            '<textarea id="bulk" rows="4" placeholder="Paste part numbers, one per line&#10;101798&#10;106064&#10;107169"></textarea>' +
+            '<div class="bulkside">' +
+              '<label>Default color</label><select id="defColor"></select>' +
+              '<label>Default hangers / unit</label>' +
+              '<input id="defHangers" type="number" step="0.01" min="0" value="' + CFG.DEFAULT_HANGERS + '">' +
+              '<button type="button" class="btn" onclick="gyhPS_addBulk()">Add to grid</button>' +
+            '</div>' +
+          '</div>' +
+        '</section>' +
+
+        '<section class="card">' +
+          '<div class="cardhead"><h2>2 &middot; Review rows</h2>' +
+            '<div><button type="button" class="btn ghost" onclick="gyhPS_addRow()">+ Row</button>' +
+            '<button type="button" class="btn ghost" onclick="gyhPS_clearRows()">Clear</button></div></div>' +
+          '<table><thead><tr>' +
+            '<th style="width:15%">Part number</th>' +
+            '<th style="width:14%">Becomes parent</th>' +
+            '<th style="width:26%">Color (phantom)</th>' +
+            '<th style="width:10%">Hangers / unit</th>' +
+            '<th>Status</th><th style="width:30px"></th>' +
+          '</tr></thead><tbody id="body"></tbody></table>' +
+          '<p class="hint">One number, used for both the phantom BOM quantity and the ' +
+          'POWDERCOAT operation run rate &mdash; they are the same thing by definition.</p>' +
+        '</section>' +
+
+        '<section class="card">' +
+          '<h2>3 &middot; Validate, then commit</h2>' +
+          '<div class="actions">' +
+            '<label class="inline">Cutover date <input id="cutover" type="text" placeholder="m/d/yyyy" style="width:110px"></label>' +
+            '<button type="button" class="btn" id="btnVal" onclick="gyhPS_doValidate()">Validate (read only)</button>' +
+            '<button type="button" class="btn go" id="btnGo" onclick="gyhPS_doCommit()" disabled>Commit split</button>' +
+            '<span id="msg" class="msg"></span>' +
+          '</div>' +
+          '<p class="hint">The old fab revision is end-dated the day before the cutover date and the ' +
+          'new powder revision starts on it.</p>' +
+          '<p class="warn"><b>This cannot be undone from here.</b> Run it in SB2 first. ' +
+          'On-hand stays on the parent, which is now the coated <code>' + esc(CFG.SUFFIX.trim()) +
+          '</code> item, and the child starts at zero &mdash; move stock by hand if what is physically ' +
+          'on the shelf is bare. Vendor records and purchase prices also stay on the parent.</p>' +
+        '</section>' +
+      '</div>' +
+      '<script>(function(){' +
+      'var COLORS=' + JSON.stringify(colors) + ';var SUFFIX=' + JSON.stringify(CFG.SUFFIX) +
+      ';var MAXROWS=' + CFG.MAX_ROWS + ';var WRAP=' + JSON.stringify(W) + ';' +
+      clientJs() + '})();</script>';
   };
 
-  const attachBom = (itemId, bomId, asMasterDefault) => {
-    const item = record.load({ type: record.Type.ASSEMBLY_ITEM, id: itemId, isDynamic: true });
-    const s = 'billofmaterials';
-    const n = item.getLineCount({ sublistId: s });
-    for (let i = 0; i < n; i++) {
-      item.selectLine({ sublistId: s, line: i });
-      if (String(item.getCurrentSublistValue({ sublistId: s, fieldId: 'billofmaterials' })) === String(bomId)) {
-        if (asMasterDefault) {
-          item.setCurrentSublistValue({ sublistId: s, fieldId: 'masterdefault', value: true });
-          item.commitLine({ sublistId: s });
-        }
-        item.save({ ignoreMandatoryFields: true });
-        return;
-      }
-    }
-    item.selectNewLine({ sublistId: s });
-    item.setCurrentSublistValue({ sublistId: s, fieldId: 'billofmaterials', value: bomId });
-    if (asMasterDefault) item.setCurrentSublistValue({ sublistId: s, fieldId: 'masterdefault', value: true });
-    item.commitLine({ sublistId: s });
-    item.save({ ignoreMandatoryFields: true });
-  };
+  // All lookups are scoped to the wrapper div (ROOT), never bare
+  // document.getElementById, so nothing here can touch or be shadowed by
+  // NetSuite's own page elements. The five entry points referenced from
+  // inline onclick= attributes are hung on window with a gyhPS_ prefix so
+  // they resolve from outside this IIFE's closure; everything else stays
+  // private inside it.
+  const clientJs = () => [
+    'var ROOT=document.getElementById(WRAP);',
+    'function $(sel){return ROOT.querySelector(sel);}',
 
-  // ------------------------------------------------------- routing plumbing
-  /**
-   * Move the live fab routing(s) off the parent BOM and onto the child BOM.
-   * Inactive routings and other subsidiaries (the "-TECH_ONLY" leftovers on
-   * subsidiary 4 / location 16) are deliberately left alone.
-   */
-  const repointRoutings = (fromBomId, toBomId) => {
-    const rows = query.runSuiteQL({
-      query: 'SELECT id, name FROM manufacturingrouting ' +
-             "WHERE billofmaterials = ? AND isinactive = 'F' AND subsidiary = ?",
-      params: [fromBomId, CFG.SUBSIDIARY]
-    }).asMappedResults();
+    'function colorOpts(sel){var s="<option value=\'\'>-- select --</option>";',
+    'for(var i=0;i<COLORS.length;i++){s+="<option value=\'"+COLORS[i].id+"\'"+',
+    '(String(sel)===String(COLORS[i].id)?" selected":"")+">"+COLORS[i].label+"</option>";}return s;}',
 
-    const moved = [];
-    rows.forEach((r) => {
-      record.submitFields({
-        type: record.Type.MANUFACTURING_ROUTING,
-        id: r.id,
-        values: { billofmaterials: toBomId },
-        options: { ignoreMandatoryFields: true }
-      });
-      moved.push(r.id + ' (' + r.name + ')');
-    });
-    return moved;
-  };
+    '$("#defColor").innerHTML=colorOpts("");',
+    '(function(){var d=new Date();$("#cutover").value=',
+    '(d.getMonth()+1)+"/"+d.getDate()+"/"+d.getFullYear();})();',
 
-  const createRouting = (parentName, bomId, runRate) => {
-    const rt = record.create({ type: record.Type.MANUFACTURING_ROUTING, isDynamic: false });
-    rt.setValue({ fieldId: 'name', value: parentName + ' ROUTING' });
-    rt.setValue({ fieldId: 'billofmaterials', value: bomId });
-    rt.setValue({ fieldId: 'subsidiary', value: CFG.SUBSIDIARY });
-    rt.setValue({ fieldId: 'location', value: CFG.LOCATION });
-    rt.setValue({ fieldId: 'isdefault', value: true });
-    rt.setValue({ fieldId: 'autocalculatelag', value: false });
+    'function addRow(part,color,hangers){var tb=$("#body");',
+    'if(tb.rows.length>=MAXROWS){alert("Max "+MAXROWS+" rows per run.");return;}',
+    'var tr=tb.insertRow();tr.innerHTML=',
+    '"<td><input class=\'p\' value=\'"+(part||"")+"\' oninput=\'gyhPS_syncName(this)\'></td>"+',
+    '"<td class=\'pn mono\'>"+(part?part+SUFFIX:"")+"</td>"+',
+    '"<td><select class=\'c\'>"+colorOpts(color)+"</select></td>"+',
+    '"<td><input class=\'h\' type=\'number\' step=\'0.01\' min=\'0\' value=\'"+(hangers||"")+"\'></td>"+',
+    '"<td class=\'st\'></td>"+',
+    '"<td><button type=\'button\' class=\'x\' onclick=\'gyhPS_removeRow(this)\'>&times;</button></td>";',
+    'dirty();}',
 
-    const s = 'routingstep';
-    rt.setSublistValue({ sublistId: s, fieldId: 'operationsequence', line: 0, value: CFG.PC_OP_SEQ });
-    rt.setSublistValue({ sublistId: s, fieldId: 'operationname', line: 0, value: CFG.PC_OP_NAME });
-    rt.setSublistValue({ sublistId: s, fieldId: 'manufacturingworkcenter', line: 0, value: CFG.PC_WORKCENTER });
-    rt.setSublistValue({ sublistId: s, fieldId: 'manufacturingcosttemplate', line: 0, value: CFG.PC_COST_TEMPLATE });
-    rt.setSublistValue({ sublistId: s, fieldId: 'setuptime', line: 0, value: CFG.PC_SETUP_TIME });
-    rt.setSublistValue({ sublistId: s, fieldId: 'runrate', line: 0, value: runRate });
+    'function removeRow(btn){btn.closest("tr").remove();dirty();}',
 
-    return rt.save({ ignoreMandatoryFields: true });
-  };
+    'function syncName(el){var tr=el.closest("tr");var v=el.value.trim();',
+    'tr.querySelector(".pn").textContent=v?v+SUFFIX:"";dirty();}',
 
-  // ---------------------------------------------------------------- helpers
-  const parseDate = (mdy) => {
-    if (mdy) {
-      try { return format.parse({ value: mdy, type: format.Type.DATE }); }
-      catch (e) { log.audit('Bad cutover date, using today', mdy); }
-    }
-    return new Date();
-  };
+    'function addBulk(){var txt=$("#bulk").value;',
+    'var c=$("#defColor").value;',
+    'var h=$("#defHangers").value;',
+    'var lines=txt.split(/[\\r\\n,;\\t]+/);var n=0;',
+    'for(var i=0;i<lines.length;i++){var p=lines[i].trim();if(p){addRow(p,c,h);n++;}}',
+    '$("#bulk").value="";',
+    'if(!n)setMsg("Nothing to add.","e");else setMsg(n+" row(s) added.","");}',
 
-  const addDays = (d, n) => {
-    const out = new Date(d.getTime());
-    out.setDate(out.getDate() + n);
-    return out;
-  };
+    'function clearRows(){$("#body").innerHTML="";dirty();}',
 
-  // -------------------------------------------------------------- summarize
-  const summarize = (ctx) => {
-    const ok = [], failed = [];
-    ctx.output.iterator().each((key, value) => {
-      const r = JSON.parse(value);
-      (r.ok ? ok : failed).push(r);
-      return true;
-    });
+    'function collect(){var out=[];var rows=$("#body").rows;',
+    'for(var i=0;i<rows.length;i++){var t=rows[i];out.push({partNumber:t.querySelector(".p").value.trim(),',
+    'phantomItemId:t.querySelector(".c").value,',
+    'hangers:t.querySelector(".h").value});}return out;}',
 
-    try {
-      ctx.mapSummary.errors.iterator().each((k, e) => { log.error('Unhandled map error ' + k, e); return true; });
-    } catch (e) { /* no errors collection */ }
+    'function dirty(){$("#btnGo").disabled=true;}',
+    'function setMsg(m,k){var e=$("#msg");e.textContent=m;e.className="msg "+(k||"");}',
 
-    log.audit('Powder split finished', { succeeded: ok.length, failed: failed.length });
+    'function post(body,cb){var b=$("#btnVal"),g=$("#btnGo");',
+    'b.disabled=true;g.disabled=true;',
+    'fetch(window.location.href,{method:"POST",headers:{"Content-Type":"application/json"},',
+    'body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(d){b.disabled=false;cb(d);})',
+    '.catch(function(e){b.disabled=false;setMsg("Request failed: "+e,"e");});}',
 
-    const lines = ['POWDER COAT SPLIT RESULTS',
-                   'Succeeded: ' + ok.length + '   Failed: ' + failed.length, ''];
-    ok.forEach((r) => {
-      const c = r.created;
-      lines.push('OK  ' + r.partNumber);
-      lines.push('      parent  ' + c.parentName + '  (item ' + c.parentId + ')');
-      lines.push('      child   ' + c.childName + '  (item ' + c.childId + ')');
-      lines.push('      parent BOM ' + c.parentBomId + '  new rev ' + c.parentRevisionId +
-                 ' "' + c.parentRevisionName + '"');
-      if (c.childBomId) lines.push('      child BOM  ' + c.childBomId + '  rev ' + c.childRevisionId);
-      if (c.routingsRepointed && c.routingsRepointed.length) {
-        lines.push('      repointed  ' + c.routingsRepointed.join(', '));
-      }
-      lines.push('      powder routing ' + c.routingId);
-      (r.notes || []).forEach((n) => lines.push('      ! ' + n));
-    });
-    failed.forEach((r) => lines.push('FAIL ' + r.partNumber + ': ' + r.error));
+    'function plan(r){var p=[];',
+    'if(r.resume){p.push("<b>RESUME</b>: rename+copy already done, finishing BOM/routing only");}',
+    'if(r.fabBomName){p.push("BOM <span class=\'mono\'>"+r.fabBomName+"</span> renamed, rev <span class=\'mono\'>"',
+    '+(r.fabRevName||"?")+"</span> closed, <span class=\'mono\'>"+r.newRevName+"</span> added");',
+    'p.push("child BOM <span class=\'mono\'>"+r.partNumber+" BOM</span> cloned from it");}',
+    'if(r.routings&&r.routings.length){p.push("repoint "+r.routings.length+" routing: <span class=\'mono\'>"',
+    '+r.routings.join(", ")+"</span>");}',
+    'p.push("new <span class=\'mono\'>"+r.parentName+" ROUTING</span> @ run rate "+r.hangers);',
+    'return "<div class=\'plan\'>"+p.join(" &middot; ")+"</div>";}',
 
-    const body = lines.join('\n');
-    log.audit('Summary', body);
+    'function doValidate(){var rows=collect();if(!rows.length){setMsg("Add some part numbers first.","e");return;}',
+    'setMsg("Validating...","");',
+    'post({action:"validate",rows:rows,cutoverDate:$("#cutover").value},function(d){',
+    'if(!d.ok){setMsg(d.error||"Validation failed.","e");return;}',
+    'var tb=$("#body").rows;var errs=0,warns=0;',
+    'for(var i=0;i<d.rows.length;i++){var r=d.rows[i];var cell=tb[i].querySelector(".st");',
+    'if(r.status==="error"){errs++;cell.innerHTML="<span class=\'bad\'>ERROR</span> "+r.messages.join(" ");}',
+    'else if(r.status==="warn"){warns++;cell.innerHTML="<span class=\'wrn\'>CHECK</span> "+r.messages.join(" ")+plan(r);}',
+    'else{cell.innerHTML="<span class=\'good\'>READY</span>"+plan(r);}}',
+    'if(errs){setMsg(errs+" error(s) -- fix before committing.","e");}',
+    'else{$("#btnGo").disabled=false;',
+    'setMsg("Ready: "+d.rows.length+" part(s)"+(warns?", "+warns+" with warnings":"")+".","g");}});}',
 
-    if (CFG.EMAIL_SUMMARY) {
-      try {
-        const me = runtime.getCurrentUser().id;
-        email.send({
-          author: me, recipients: me,
-          subject: 'Powder coat split: ' + ok.length + ' ok, ' + failed.length + ' failed',
-          body: body
-        });
-      } catch (e) {
-        log.error('Summary email failed', e);
-      }
-    }
-  };
+    'function doCommit(){var rows=collect();',
+    'if(!confirm("Split "+rows.length+" part(s)? This renames live item and BOM records and cannot be undone here."))return;',
+    'setMsg("Submitting...","");',
+    'post({action:"commit",rows:rows,cutoverDate:$("#cutover").value},function(d){',
+    'if(!d.ok){setMsg(d.error||"Commit failed.","e");return;}',
+    'setMsg("Queued "+d.count+" part(s). Map/Reduce task "+d.taskId+". Watch the Script Execution Log.","g");});}',
 
-  return { getInputData, map, summarize };
+    // exposed entry points for the inline onclick= handlers in the markup above
+    'window.gyhPS_addRow=function(){addRow();};',
+    'window.gyhPS_addBulk=addBulk;',
+    'window.gyhPS_clearRows=clearRows;',
+    'window.gyhPS_removeRow=removeRow;',
+    'window.gyhPS_syncName=syncName;',
+    'window.gyhPS_doValidate=doValidate;',
+    'window.gyhPS_doCommit=doCommit;',
+
+    'addRow();'
+  ].join('');
+
+  // All selectors are prefixed with #WRAPPER_ID so nothing here can leak
+  // onto or collide with the surrounding NetSuite page. The one exception
+  // is .uir-page-title, which is NetSuite's own page-title band -- that
+  // single global rule just hides it for a cleaner look; nothing else
+  // outside the wrapper is touched.
+  const css = (w) => [
+    '.uir-page-title{display:none}',
+
+    '#' + w + '{box-sizing:border-box;font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;',
+    'background:#f4f5f7;color:#1f2430;max-width:1240px;margin:0 auto;padding:20px}',
+    '#' + w + ' *{box-sizing:border-box}',
+    '#' + w + ' header h1{margin:0 0 4px;font-size:21px}',
+    '#' + w + ' header .sub{margin:0 0 18px;color:#667;max-width:900px}',
+    '#' + w + ' .card{background:#fff;border:1px solid #e2e5ea;border-radius:8px;padding:16px;margin-bottom:14px}',
+    '#' + w + ' .card h2{margin:0 0 12px;font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:#5a6474}',
+    '#' + w + ' .cardhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}',
+    '#' + w + ' .cardhead h2{margin:0}',
+    '#' + w + ' .bulk{display:flex;gap:14px}',
+    '#' + w + ' .bulk textarea{flex:1;padding:8px;border:1px solid #ccd2da;border-radius:6px;',
+    'font:12px/1.4 ui-monospace,Menlo,Consolas,monospace;resize:vertical}',
+    '#' + w + ' .bulkside{width:250px;display:flex;flex-direction:column;gap:4px}',
+    '#' + w + ' .bulkside label{font-size:11px;color:#667;text-transform:uppercase;letter-spacing:.04em}',
+    '#' + w + ' select,#' + w + ' input{padding:6px 7px;border:1px solid #ccd2da;border-radius:5px;font:inherit;width:100%;background:#fff}',
+    '#' + w + ' table{width:100%;border-collapse:collapse}',
+    '#' + w + ' th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:#5a6474;',
+    'padding:6px;border-bottom:1px solid #e2e5ea}',
+    '#' + w + ' td{padding:5px 6px;border-bottom:1px solid #f0f2f5;vertical-align:middle}',
+    '#' + w + ' .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}',
+    '#' + w + ' .pn{color:#2b6cb0}',
+    '#' + w + ' .st{font-size:12px;color:#556}',
+    '#' + w + ' .plan{margin-top:3px;color:#4a5568;font-size:11.5px}',
+    '#' + w + ' .btn{padding:7px 13px;border:1px solid #2b6cb0;background:#2b6cb0;color:#fff;border-radius:6px;',
+    'cursor:pointer;font:inherit;font-weight:600}',
+    '#' + w + ' .btn.ghost{background:#fff;color:#2b6cb0;margin-left:6px}',
+    '#' + w + ' .btn.go{background:#1f7a4d;border-color:#1f7a4d}',
+    '#' + w + ' .btn:disabled{opacity:.45;cursor:not-allowed}',
+    '#' + w + ' .x{border:none;background:none;color:#b33;font-size:17px;cursor:pointer;line-height:1}',
+    '#' + w + ' .actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
+    '#' + w + ' .inline{display:flex;align-items:center;gap:6px;font-size:12px;color:#5a6474;white-space:nowrap}',
+    '#' + w + ' .msg{font-weight:600}',
+    '#' + w + ' .msg.e{color:#b3261e}',
+    '#' + w + ' .msg.g{color:#1f7a4d}',
+    '#' + w + ' .good{color:#1f7a4d;font-weight:700}',
+    '#' + w + ' .wrn{color:#a86400;font-weight:700}',
+    '#' + w + ' .bad{color:#b3261e;font-weight:700}',
+    '#' + w + ' .hint{color:#889;font-size:12px;margin:8px 0 0}',
+    '#' + w + ' .warn{margin:12px 0 0;padding:9px 11px;background:#fff8e6;border:1px solid #f0dca8;border-radius:6px;color:#6b4e00}',
+    '#' + w + ' code{font-family:ui-monospace,Menlo,Consolas,monospace;background:#eef1f5;padding:1px 4px;border-radius:3px}'
+  ].join('');
+
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  return { onRequest };
 });
