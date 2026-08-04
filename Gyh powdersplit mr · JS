@@ -162,6 +162,42 @@ define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
     const cutover = parseDate(row.cutoverDate);          // new parent rev starts here
     const dayBefore = addDays(cutover, -1);              // old fab rev ends here
 
+    // ------------------------------------------- descriptions-only back-fill
+    // For parts already fully split by an earlier build that never applied the
+    // color. Touches the two description sets and nothing else -- no rename,
+    // no copy, no BOM, no routing.
+    if (String(row.mode) === 'descriptions') {
+      if (!colorText) throw new Error('No color wording resolved from phantom item ' + phantomId +
+                                      '; nothing to back-fill.');
+      const pId = Number(row.parentInternalId);
+      const cId = Number(row.itemInternalId);
+
+      const p = record.load({ type: record.Type.ASSEMBLY_ITEM, id: pId, isDynamic: false });
+      const pReport = applyColor(p, colorText);
+      p.save({ ignoreMandatoryFields: true });
+
+      const c = record.load({ type: record.Type.ASSEMBLY_ITEM, id: cId, isDynamic: false });
+      const cReport = clearColor(c, colorText);
+      c.save({ ignoreMandatoryFields: true });
+
+      const check = verifyColor(pId, colorText);
+
+      result.created.parentId = pId;
+      result.created.parentName = parentName;
+      result.created.childId = cId;
+      result.created.childName = origName;
+      result.created.mode = 'descriptions';
+      result.notes.push('Descriptions only, color "' + colorText + '".');
+      pReport.forEach((n) => result.notes.push('parent ' + n));
+      cReport.forEach((n) => result.notes.push('child ' + n));
+      result.notes.push(check);
+      if (check.indexOf('VERIFY FAILED') === 0) {
+        throw new Error('Color did not persist on item ' + pId + ' after save. ' +
+                        'Field attempts: ' + pReport.join('; '));
+      }
+      return;
+    }
+
     let origId, childId;
 
     if (resume) {
@@ -187,9 +223,11 @@ define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
       // Color appended to the END of each description field, matching PROD: on
       // 104655 - BK the display name, sales order description and purchase
       // description all end in the color.
-      applyColor(parent, colorText);
+      const pReport = applyColor(parent, colorText);
       parent.setValue({ fieldId: 'costestimatetype', value: CFG.COST_ESTIMATE_TYPE });
       parent.save({ ignoreMandatoryFields: true });
+      pReport.forEach((n) => result.notes.push('parent ' + n));
+      result.notes.push(verifyColor(origId, colorText));
       result.created.parentId = origId;
       result.created.parentName = parentName;
 
@@ -212,12 +250,13 @@ define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
     if (resume && colorText) {
       try {
         const p = record.load({ type: record.Type.ASSEMBLY_ITEM, id: origId, isDynamic: false });
-        applyColor(p, colorText);
+        const pReport = applyColor(p, colorText);
         p.save({ ignoreMandatoryFields: true });
         const c = record.load({ type: record.Type.ASSEMBLY_ITEM, id: childId, isDynamic: false });
         clearColor(c, colorText);
         c.save({ ignoreMandatoryFields: true });
-        result.notes.push('Descriptions back-filled with "' + colorText + '" on the parent.');
+        pReport.forEach((n) => result.notes.push('parent ' + n));
+        result.notes.push(verifyColor(origId, colorText));
       } catch (e) {
         result.notes.push('Could not back-fill descriptions: ' + (e.message || e));
       }
@@ -310,16 +349,32 @@ define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
   };
 
   // ------------------------------------------------------- description fields
-  // In PROD the color appears on all three of these. NetSuite field IDs:
-  //   displayname         -> Display Name/Code
-  //   salesdescription    -> Sales Order Description (SuiteQL: description)
-  //   purchasedescription -> Purchase Description
-  const DESC_FIELDS = ['displayname', 'salesdescription', 'purchasedescription'];
+  // Each slot lists candidate field IDs, tried in order. NetSuite exposes the
+  // Sales Order Description as `salesdescription` in SuiteScript but as
+  // `description` in SuiteQL, and custom forms vary, so both are attempted.
+  const DESC_SLOTS = [
+    { label: 'Display Name',     fields: ['displayname'] },
+    { label: 'Sales Order Desc', fields: ['salesdescription', 'description'] },
+    { label: 'Purchase Desc',    fields: ['purchasedescription'] }
+  ];
+
+  /** Read a slot's value, returning the field ID that actually worked. */
+  const readSlot = (rec, slot) => {
+    for (let i = 0; i < slot.fields.length; i++) {
+      try {
+        const v = rec.getValue({ fieldId: slot.fields[i] });
+        if (v !== null && v !== undefined) {
+          return { fieldId: slot.fields[i], value: String(v) };
+        }
+      } catch (e) { /* try next candidate */ }
+    }
+    return null;
+  };
 
   // Same map as the Suitelet. Duplicated deliberately: the MR resolves the
   // color from the phantom item itself rather than trusting the payload, so a
   // version mismatch between the two files can never silently drop the color
-  // again (that is exactly what left 101255 - SV without "SILVER VEIN").
+  // again (that is exactly what left these parts without their color).
   const COLORS = [
     { match: 'SILVER VEIN',    code: 'SV',  text: 'SILVER VEIN' },
     { match: 'TEXTURE BLACK',  code: 'BK',  text: 'TEXTURED BLACK' },
@@ -340,7 +395,7 @@ define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
       }).asMappedResults();
       if (r.length) name = String(r[0].itemid || '');
     } catch (e) {
-      log.audit('Could not read phantom item ' + phantomId, e.message);
+      log.error('Could not read phantom item ' + phantomId, e.message);
       return '';
     }
 
@@ -353,7 +408,7 @@ define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
     for (let i = 0; i < COLORS.length; i++) {
       if (raw.indexOf(COLORS[i].match) !== -1) return COLORS[i].text;
     }
-    log.audit('No color mapping for phantom "' + name + '"', 'descriptions left unchanged');
+    log.error('No color mapping for phantom "' + name + '"', 'descriptions left unchanged');
     return '';
   };
 
@@ -368,35 +423,68 @@ define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
 
   /**
    * Append the color to the END of each description field, preserving that
-   * field's own existing text. Each field is handled independently -- they are
-   * not forced to share one value -- and empty fields are left empty rather
-   * than invented. Stripping first makes this safe to re-run.
+   * field's own existing text. Returns a report of exactly what happened per
+   * slot so failures are visible in the log instead of being swallowed --
+   * silent catches here are why this appeared to work when it did not.
    */
   const applyColor = (rec, colorText) => {
-    if (!colorText) return;
-    DESC_FIELDS.forEach((f) => {
+    const report = [];
+    if (!colorText) return ['no color text resolved -- nothing attempted'];
+
+    DESC_SLOTS.forEach((slot) => {
+      const found = readSlot(rec, slot);
+      if (!found) { report.push(slot.label + ': no readable field'); return; }
+      if (!found.value.trim()) { report.push(slot.label + ': empty, skipped'); return; }
+
+      const next = (stripColor(found.value, colorText) + ' ' + colorText).trim();
       try {
-        const cur = String(rec.getValue({ fieldId: f }) || '').trim();
-        if (!cur) return;
-        rec.setValue({ fieldId: f, value: (stripColor(cur, colorText) + ' ' + colorText).trim() });
+        rec.setValue({ fieldId: found.fieldId, value: next });
+        report.push(slot.label + ' (' + found.fieldId + '): set');
       } catch (e) {
-        log.audit('Could not set ' + f, e.message);
+        report.push(slot.label + ' (' + found.fieldId + '): FAILED -- ' + (e.message || e));
+        log.error('setValue failed on ' + found.fieldId, e);
       }
     });
+    return report;
   };
 
   /** Strip the color back off each description field (used on the bare child). */
   const clearColor = (rec, colorText) => {
-    if (!colorText) return;
-    DESC_FIELDS.forEach((f) => {
+    const report = [];
+    if (!colorText) return report;
+
+    DESC_SLOTS.forEach((slot) => {
+      const found = readSlot(rec, slot);
+      if (!found || !found.value.trim()) return;
+      const next = stripColor(found.value, colorText);
+      if (next === found.value.trim()) return;
       try {
-        const cur = String(rec.getValue({ fieldId: f }) || '').trim();
-        if (!cur) return;
-        rec.setValue({ fieldId: f, value: stripColor(cur, colorText) });
+        rec.setValue({ fieldId: found.fieldId, value: next });
+        report.push(slot.label + ': stripped');
       } catch (e) {
-        log.audit('Could not set ' + f, e.message);
+        report.push(slot.label + ': FAILED -- ' + (e.message || e));
+        log.error('setValue failed on ' + found.fieldId, e);
       }
     });
+    return report;
+  };
+
+  /** Confirm after save that the color actually landed. */
+  const verifyColor = (itemId, colorText) => {
+    try {
+      const r = query.runSuiteQL({
+        query: 'SELECT displayname, description, purchasedescription FROM item WHERE id = ?',
+        params: [itemId]
+      }).asMappedResults();
+      if (!r.length) return 'verify: item not found';
+      const hay = [r[0].displayname, r[0].description, r[0].purchasedescription]
+        .map((s) => String(s || '').toUpperCase()).join(' | ');
+      return hay.indexOf(String(colorText).toUpperCase()) !== -1
+        ? 'verified: color present after save'
+        : 'VERIFY FAILED: color NOT present after save';
+    } catch (e) {
+      return 'verify skipped: ' + (e.message || e);
+    }
   };
 
   /**
