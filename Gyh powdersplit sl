@@ -480,13 +480,13 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
             '<table class="layout"><tr>' +
               '<td class="lcell">' +
                 '<div class="flabel">Part Numbers</div>' +
-                '<textarea id="bulk" rows="5" placeholder="One per line&#10;101798&#10;106064&#10;107169"></textarea>' +
+                '<textarea id="gyhps_bulk" rows="5" placeholder="One per line&#10;101798&#10;106064&#10;107169"></textarea>' +
               '</td>' +
               '<td class="rcell">' +
                 '<div class="flabel">Default Color</div>' +
-                '<select id="defColor"></select>' +
+                '<select id="gyhps_defColor"></select>' +
                 '<div class="flabel">Default Hangers / Unit</div>' +
-                '<input id="defHangers" type="number" step="0.01" min="0" value="' + CFG.DEFAULT_HANGERS + '">' +
+                '<input id="gyhps_defHangers" type="number" step="0.01" min="0" value="' + CFG.DEFAULT_HANGERS + '">' +
                 '<button type="button" class="btn primary block" onclick="gyhPS_addBulk()">Add To Grid</button>' +
               '</td>' +
             '</tr></table>' +
@@ -500,14 +500,20 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
               '<button type="button" class="btn sm" onclick="gyhPS_clearRows()">Clear</button>' +
             '</span>' +
           '</div>' +
-          '<table class="sublist"><thead><tr>' +
+          '<table class="sublist">' +
+            '<colgroup>' +
+              '<col style="width:110px"><col style="width:130px">' +
+              '<col style="width:230px"><col style="width:70px">' +
+              '<col><col style="width:28px">' +
+            '</colgroup>' +
+            '<thead><tr>' +
             '<th class="c-part">Part Number</th>' +
             '<th class="c-par">Becomes Parent</th>' +
             '<th class="c-col">Color (Phantom)</th>' +
             '<th class="c-qty">Hangers</th>' +
             '<th class="c-st">Status</th>' +
             '<th class="c-x"></th>' +
-          '</tr></thead><tbody id="body"></tbody></table>' +
+          '</tr></thead><tbody id="gyhps_body"></tbody></table>' +
           '<div class="fgnote">One number drives both the phantom BOM quantity and the ' +
           'POWDERCOAT operation run rate &mdash; they are the same thing by definition.</div>' +
         '</div>' +
@@ -517,10 +523,10 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
           '<div class="fgbody">' +
             '<div class="actions">' +
               '<span class="flabel inline">Cutover Date</span>' +
-              '<input id="cutover" type="text" class="dt">' +
-              '<button type="button" class="btn" id="btnVal" onclick="gyhPS_doValidate()">Validate (Read Only)</button>' +
-              '<button type="button" class="btn primary" id="btnGo" onclick="gyhPS_doCommit()" disabled>Commit Split</button>' +
-              '<span id="msg" class="msg"></span>' +
+              '<input id="gyhps_cutover" type="text" class="dt">' +
+              '<button type="button" class="btn" id="gyhps_btnVal" onclick="gyhPS_doValidate()">Validate (Read Only)</button>' +
+              '<button type="button" class="btn primary" id="gyhps_btnGo" onclick="gyhPS_doCommit()" disabled>Commit Split</button>' +
+              '<span id="gyhps_msg" class="msg"></span>' +
             '</div>' +
             '<div class="fgnote">The old fab revision is end-dated the day before the cutover ' +
             'date and the new powder revision starts on it.</div>' +
@@ -552,8 +558,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
     'for(var i=0;i<COLORS.length;i++){s+="<option value=\'"+COLORS[i].id+"\'"+',
     '(String(sel)===String(COLORS[i].id)?" selected":"")+">"+COLORS[i].label+"</option>";}return s;}',
 
-    '$("#defColor").innerHTML=colorOpts("");',
-    '(function(){var d=new Date();$("#cutover").value=',
+    '$("#gyhps_defColor").innerHTML=colorOpts("");',
+    '(function(){var d=new Date();$("#gyhps_cutover").value=',
     '(d.getMonth()+1)+"/"+d.getDate()+"/"+d.getFullYear();})();',
 
     'function codeFor(colorId){for(var i=0;i<COLORS.length;i++){',
@@ -565,7 +571,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
 
     'function refreshName(tr){tr.querySelector(".pn").textContent=rowName(tr);dirty();}',
 
-    'function addRow(part,color,hangers){var tb=$("#body");',
+    'function addRow(part,color,hangers){var tb=$("#gyhps_body");',
     'if(tb.rows.length>=MAXROWS){alert("Max "+MAXROWS+" rows per run.");return;}',
     'var tr=tb.insertRow();tr.innerHTML=',
     '"<td><input class=\'p\' value=\'"+(part||"")+"\' oninput=\'gyhPS_syncName(this)\'></td>"+',
@@ -581,25 +587,27 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
 
     'function syncName(el){refreshName(el.closest("tr"));}',
 
-    'function addBulk(){var txt=$("#bulk").value;',
-    'var c=$("#defColor").value;',
-    'var h=$("#defHangers").value;',
+    'function addBulk(){var txt=$("#gyhps_bulk").value;',
+    'var tb0=$("#gyhps_body");',
+    'if(tb0.rows.length===1&&!tb0.rows[0].querySelector(".p").value.trim()){tb0.deleteRow(0);}',
+    'var c=$("#gyhps_defColor").value;',
+    'var h=$("#gyhps_defHangers").value;',
     'var lines=txt.split(/[\\r\\n,;\\t]+/);var n=0;',
     'for(var i=0;i<lines.length;i++){var p=lines[i].trim();if(p){addRow(p,c,h);n++;}}',
-    '$("#bulk").value="";',
+    '$("#gyhps_bulk").value="";',
     'if(!n)setMsg("Nothing to add.","e");else setMsg(n+" row(s) added.","");}',
 
-    'function clearRows(){$("#body").innerHTML="";dirty();}',
+    'function clearRows(){$("#gyhps_body").innerHTML="";dirty();}',
 
-    'function collect(){var out=[];var rows=$("#body").rows;',
+    'function collect(){var out=[];var rows=$("#gyhps_body").rows;',
     'for(var i=0;i<rows.length;i++){var t=rows[i];out.push({partNumber:t.querySelector(".p").value.trim(),',
     'phantomItemId:t.querySelector(".c").value,',
     'hangers:t.querySelector(".h").value});}return out;}',
 
-    'function dirty(){$("#btnGo").disabled=true;}',
-    'function setMsg(m,k){var e=$("#msg");e.textContent=m;e.className="msg "+(k||"");}',
+    'function dirty(){$("#gyhps_btnGo").disabled=true;}',
+    'function setMsg(m,k){var e=$("#gyhps_msg");e.textContent=m;e.className="msg "+(k||"");}',
 
-    'function post(body,cb){var b=$("#btnVal"),g=$("#btnGo");',
+    'function post(body,cb){var b=$("#gyhps_btnVal"),g=$("#gyhps_btnGo");',
     'b.disabled=true;g.disabled=true;',
     'fetch(window.location.href,{method:"POST",headers:{"Content-Type":"application/json"},',
     'body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(d){b.disabled=false;cb(d);})',
@@ -622,22 +630,22 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
 
     'function doValidate(){var rows=collect();if(!rows.length){setMsg("Add some part numbers first.","e");return;}',
     'setMsg("Validating...","");',
-    'post({action:"validate",rows:rows,cutoverDate:$("#cutover").value},function(d){',
+    'post({action:"validate",rows:rows,cutoverDate:$("#gyhps_cutover").value},function(d){',
     'if(!d.ok){setMsg(d.error||"Validation failed.","e");return;}',
-    'var tb=$("#body").rows;var errs=0,warns=0;',
+    'var tb=$("#gyhps_body").rows;var errs=0,warns=0;',
     'for(var i=0;i<d.rows.length;i++){var r=d.rows[i];var cell=tb[i].querySelector(".st");',
     'var note=r.messages&&r.messages.length?"<div>"+r.messages.join(" ")+"</div>":"";',
     'if(r.status==="error"){errs++;cell.innerHTML=badge("bad","ERROR")+note;}',
     'else if(r.status==="warn"){warns++;cell.innerHTML=badge("wrn",r.mode==="descriptions"?"DESC ONLY":"CHECK")+note+plan(r);}',
     'else{cell.innerHTML=badge("good","READY")+plan(r);}}',
     'if(errs){setMsg(errs+" error(s) \u2013 fix before committing.","e");}',
-    'else{$("#btnGo").disabled=false;',
+    'else{$("#gyhps_btnGo").disabled=false;',
     'setMsg("Ready: "+d.rows.length+" part(s)"+(warns?", "+warns+" with warnings":"")+".","g");}});}',
 
     'function doCommit(){var rows=collect();',
     'if(!confirm("Split "+rows.length+" part(s)? This renames live item and BOM records and cannot be undone here."))return;',
     'setMsg("Submitting...","");',
-    'post({action:"commit",rows:rows,cutoverDate:$("#cutover").value},function(d){',
+    'post({action:"commit",rows:rows,cutoverDate:$("#gyhps_cutover").value},function(d){',
     'if(!d.ok){setMsg(d.error||"Commit failed.","e");return;}',
     'setMsg("Queued "+d.count+" part(s). Map/Reduce task "+d.taskId+". Watch the Script Execution Log.","g");});}',
 
