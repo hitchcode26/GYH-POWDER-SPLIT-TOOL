@@ -1,0 +1,430 @@
+/**
+ * GYH_PowderSplit_MR.js
+ *
+ * Companion processor for GYH_PowderSplit_SL.js. All record writes happen
+ * here so a batch of parts does not blow the 1,000-unit Suitelet governance
+ * ceiling.
+ *
+ * Modeled directly on the 101798 cutover done in PROD on 08/04/2026:
+ *
+ *   item 8641   101798        -> renamed  101798 - SV   (+ " SILVER VEIN" on
+ *                                the display name).  Keeps its internal ID,
+ *                                so inventory / history / where-used stay put.
+ *   item 28530  101798        -> new copy, the bare child.
+ *
+ *   bom 1072    101798 BOM    -> RENAMED to 101798 - SV BOM. Stays on the
+ *                                parent, so historical WOs still resolve to
+ *                                the BOM record they were built against.
+ *      rev 1320  101798 REV F        end-dated 08/02/2026 (left as history)
+ *      rev 12790 101798 - SV BOM REV F   NEW, eff 08/03/2026:
+ *                                    101798                    x1   WORK_ORDER
+ *                                    PRIME AND POWDER COAT ... x1   PHANTOM
+ *
+ *   bom 10955   101798 BOM    -> NEW BOM for the child, holding a clone of
+ *      rev 12789 101798 REV F      the last fab revision, same name, original
+ *                                  11/01/2023 start date, no end date.
+ *
+ *   routing 3709 101798 Routing  -> REPOINTED from bom 1072 to bom 10955.
+ *                                   Same name, same steps, same history.
+ *   routing 10248 101798 - SV ROUTING -> NEW on bom 1072, one op:
+ *                                   seq 9  POWDERCOAT  Hitch - Powder Coating
+ *                                   PRIME AND POWDER-COAT (COST PER HANGER)
+ *                                   run rate 0.5
+ *   routing 878  101798 Routing-TECH_ONLY -> untouched (inactive, sub 4).
+ *
+ * The phantom BOM qty on 101798 rev 12790 was entered as 1 but should have
+ * been 0.5 to match the run rate. Hangers and run rate are the same number by
+ * definition, so this script derives both from a single input and cannot
+ * reproduce that drift. 125 already-split parts in PROD have the mismatch.
+ *
+ * @NApiVersion 2.1
+ * @NScriptType MapReduceScript
+ * @NModuleScope SameAccount
+ */
+define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
+(record, query, runtime, log, format, email) => {
+
+  // ---------------------------------------------------------------- config
+  // Verified against PROD account 5262266 on 2026-08-04.
+  const CFG = {
+    PARAM: 'custscript_gyh_pcs_payload',
+
+    PC_OP_NAME: 'POWDERCOAT',   // 101798 used one word; older parts used "POWDER COAT"
+    PC_OP_SEQ: 9,
+    PC_WORKCENTER: 948410,      // entitygroup "Hitch - Powder Coating"
+    PC_COST_TEMPLATE: 38,       // "PRIME AND POWDER-COAT (COST PER HANGER)"
+    PC_SETUP_TIME: 0,
+
+    SUBSIDIARY: 2,              // GEN-Y HITCH
+    LOCATION: 1,                // Hitch
+    COST_ESTIMATE_TYPE: 'AVGCOST',
+
+    CHILD_ITEM_SOURCE: 'WORK_ORDER',
+    PHANTOM_ITEM_SOURCE: 'PHANTOM',
+
+    EMAIL_SUMMARY: true
+  };
+
+  // ------------------------------------------------------------------ input
+  const getInputData = () => {
+    const raw = runtime.getCurrentScript().getParameter({ name: CFG.PARAM });
+    if (!raw) throw new Error('No payload on ' + CFG.PARAM + '. Launch this from the Suitelet.');
+    const rows = JSON.parse(raw);
+    log.audit('Powder split starting', rows.length + ' part(s)');
+    return rows;
+  };
+
+  // -------------------------------------------------------------------- map
+  const map = (ctx) => {
+    const row = JSON.parse(ctx.value);
+    const result = { partNumber: row.partNumber, ok: false, created: {}, error: null, notes: [] };
+    try {
+      splitPart(row, result);
+      result.ok = true;
+      log.audit('Split OK: ' + row.partNumber, result.created);
+    } catch (e) {
+      result.error = e.message || String(e);
+      log.error('Split FAILED: ' + row.partNumber, e);
+    }
+    ctx.write({ key: row.partNumber, value: JSON.stringify(result) });
+  };
+
+  // ------------------------------------------------------------------- work
+  const splitPart = (row, result) => {
+    const origId     = Number(row.itemInternalId);
+    const origName   = String(row.partNumber).trim();
+    const parentName = String(row.parentName).trim();
+    const phantomId  = Number(row.phantomItemId);
+    const colorLabel = String(row.colorLabel || '').trim();
+    const hangers    = Number(row.hangers);
+    const runRate    = hangers;   // same number by definition -- see header note
+    const fabBomId   = row.fabBomId ? Number(row.fabBomId) : null;
+
+    const cutover = parseDate(row.cutoverDate);          // new parent rev starts here
+    const dayBefore = addDays(cutover, -1);              // old fab rev ends here
+
+    // ------------------------------------------------ 1. rename the original
+    const parent = record.load({ type: record.Type.ASSEMBLY_ITEM, id: origId, isDynamic: false });
+    const baseDisplay = String(parent.getValue({ fieldId: 'displayname' }) || '').trim();
+    parent.setValue({ fieldId: 'itemid', value: parentName });
+    if (colorLabel && baseDisplay.toUpperCase().indexOf(colorLabel.toUpperCase()) === -1) {
+      parent.setValue({ fieldId: 'displayname', value: (baseDisplay + ' ' + colorLabel).trim() });
+    }
+    parent.setValue({ fieldId: 'costestimatetype', value: CFG.COST_ESTIMATE_TYPE });
+    parent.save({ ignoreMandatoryFields: true });
+    result.created.parentId = origId;
+    result.created.parentName = parentName;
+
+    // -------------------------------------------- 2. copy out the bare child
+    const child = record.copy({ type: record.Type.ASSEMBLY_ITEM, id: origId, isDynamic: false });
+    child.setValue({ fieldId: 'itemid', value: origName });
+    child.setValue({ fieldId: 'displayname', value: baseDisplay });   // color-free
+    child.setValue({ fieldId: 'costestimatetype', value: CFG.COST_ESTIMATE_TYPE });
+    adjustChild(child);
+    const childId = child.save({ ignoreMandatoryFields: true });
+    result.created.childId = childId;
+    result.created.childName = origName;
+
+    if (!fabBomId) {
+      result.notes.push('No master-default BOM on the original item. No child BOM built and ' +
+                        'no routing repointed -- the powder BOM/routing below is all that was made.');
+    }
+
+    // ------------------------------- 3. clone the fab revision to a new BOM
+    //    The child gets its own BOM record so the parent can keep the
+    //    original one (and its revision history) intact.
+    let childBomId = null;
+    if (fabBomId) {
+      const fabRevId = row.fabRevId ? Number(row.fabRevId) : getCurrentRevision(fabBomId, origId);
+      if (!fabRevId) throw new Error('Could not resolve the current revision on BOM ' + fabBomId + '.');
+
+      const srcRev = record.load({ type: record.Type.BOM_REVISION, id: fabRevId, isDynamic: false });
+
+      childBomId = createBom(origName + ' BOM');
+      result.created.childBomId = childBomId;
+      result.created.childRevisionId = cloneRevision(srcRev, childBomId);
+
+      // the copy inherited the parent's BOM line -- swap it for the new one
+      replaceBoms(childId, childBomId);
+
+      // ----------------------- 4. repoint the live fab routing to that BOM
+      const moved = repointRoutings(fabBomId, childBomId);
+      result.created.routingsRepointed = moved;
+      if (!moved.length) {
+        result.notes.push('No active subsidiary-' + CFG.SUBSIDIARY + ' routing was on BOM ' +
+                          fabBomId + ', so nothing was repointed to the child.');
+      }
+
+      // ------------------- 5. rename the original BOM, close the old rev,
+      //                       add the powder rev
+      const bom = record.load({ type: record.Type.BOM, id: fabBomId, isDynamic: false });
+      bom.setValue({ fieldId: 'name', value: parentName + ' BOM' });
+      bom.save({ ignoreMandatoryFields: true });
+      result.created.parentBomId = fabBomId;
+
+      endDateRevision(fabRevId, dayBefore);
+
+      const letter = revisionLetter(srcRev.getValue({ fieldId: 'name' }));
+      result.created.parentRevisionId = createPowderRevision(
+        fabBomId, parentName + ' BOM REV ' + letter, cutover, childId, phantomId, hangers
+      );
+      result.created.parentRevisionName = parentName + ' BOM REV ' + letter;
+
+      // ---------------------------------- 6. powder routing on the same BOM
+      result.created.routingId = createRouting(parentName, fabBomId, runRate);
+
+    } else {
+      // No pre-existing BOM: build the powder BOM from scratch on the parent.
+      const bomId = createBom(parentName + ' BOM');
+      result.created.parentBomId = bomId;
+      result.created.parentRevisionName = parentName + ' BOM REV A';
+      result.created.parentRevisionId = createPowderRevision(
+        bomId, parentName + ' BOM REV A', cutover, childId, phantomId, hangers
+      );
+      attachBom(origId, bomId, true);
+      result.created.routingId = createRouting(parentName, bomId, runRate);
+    }
+  };
+
+  /**
+   * Hook for anything the bare child should NOT inherit from the copy.
+   * It is an internal WIP part, so it usually should not be sellable or
+   * carry the parent's sales pricing.
+   */
+  const adjustChild = (child) => {
+    try {
+      // child.setValue({ fieldId: 'isonline', value: false });
+      // child.setValue({ fieldId: 'salesdescription', value: '' });
+      // child.setValue({ fieldId: 'upccode', value: '' });
+    } catch (e) {
+      log.audit('adjustChild skipped a field', e.message);
+    }
+  };
+
+  // ----------------------------------------------------------- BOM plumbing
+  const getCurrentRevision = (bomId, itemId) => {
+    const r = query.runSuiteQL({
+      query: 'SELECT currentrevision FROM itemAssemblyItemBom ' +
+             'WHERE billofmaterials = ? AND assembly = ?',
+      params: [bomId, itemId]
+    }).asMappedResults();
+    return r.length && r[0].currentrevision ? Number(r[0].currentrevision) : null;
+  };
+
+  const createBom = (name) => {
+    const bom = record.create({ type: record.Type.BOM, isDynamic: false });
+    bom.setValue({ fieldId: 'name', value: name });
+    bom.setValue({ fieldId: 'includechildren', value: false });
+    bom.setValue({ fieldId: 'usecomponentyield', value: false });
+    bom.setValue({ fieldId: 'availableforallassemblies', value: false });
+    bom.setValue({ fieldId: 'availableforalllocations', value: true });  // must be T
+    bom.setValue({ fieldId: 'subsidiary', value: [CFG.SUBSIDIARY] });
+    return bom.save({ ignoreMandatoryFields: true });
+  };
+
+  /** Copy every component of an existing revision onto a new BOM, verbatim. */
+  const cloneRevision = (srcRev, targetBomId) => {
+    const rev = record.create({ type: record.Type.BOM_REVISION, isDynamic: false });
+    rev.setValue({ fieldId: 'billofmaterials', value: targetBomId });
+    rev.setValue({ fieldId: 'name', value: srcRev.getValue({ fieldId: 'name' }) });
+    rev.setValue({ fieldId: 'effectivestartdate',
+                   value: srcRev.getValue({ fieldId: 'effectivestartdate' }) });
+    // deliberately no end date -- the child BOM is the live one going forward
+
+    const s = 'component';
+    const n = srcRev.getLineCount({ sublistId: s });
+    if (!n) throw new Error('Source revision ' + srcRev.id + ' has no components.');
+
+    for (let i = 0; i < n; i++) {
+      ['item', 'bomquantity', 'componentyield', 'itemsource', 'units', 'description'].forEach((f) => {
+        try {
+          const v = srcRev.getSublistValue({ sublistId: s, fieldId: f, line: i });
+          if (v !== null && v !== '') {
+            rev.setSublistValue({ sublistId: s, fieldId: f, line: i, value: v });
+          }
+        } catch (e) { /* field not on this account's form */ }
+      });
+    }
+    return rev.save({ ignoreMandatoryFields: true });
+  };
+
+  const endDateRevision = (revId, endDate) => {
+    const rev = record.load({ type: record.Type.BOM_REVISION, id: revId, isDynamic: false });
+    rev.setValue({ fieldId: 'effectiveenddate', value: endDate });
+    rev.save({ ignoreMandatoryFields: true });
+  };
+
+  const createPowderRevision = (bomId, revName, startDate, childId, phantomId, hangers) => {
+    const rev = record.create({ type: record.Type.BOM_REVISION, isDynamic: false });
+    rev.setValue({ fieldId: 'billofmaterials', value: bomId });
+    rev.setValue({ fieldId: 'name', value: revName });
+    rev.setValue({ fieldId: 'effectivestartdate', value: startDate });
+
+    setComponent(rev, 0, childId, 1, CFG.CHILD_ITEM_SOURCE);
+    setComponent(rev, 1, phantomId, hangers, CFG.PHANTOM_ITEM_SOURCE);
+
+    return rev.save({ ignoreMandatoryFields: true });
+  };
+
+  const setComponent = (rev, line, itemId, qty, source) => {
+    const s = 'component';
+    rev.setSublistValue({ sublistId: s, fieldId: 'item', line: line, value: itemId });
+    rev.setSublistValue({ sublistId: s, fieldId: 'bomquantity', line: line, value: qty });
+    rev.setSublistValue({ sublistId: s, fieldId: 'itemsource', line: line, value: source });
+  };
+
+  /** Strip everything down to the trailing revision letter: "101798 REV F" -> "F". */
+  const revisionLetter = (revName) => {
+    const m = String(revName || '').toUpperCase().match(/REV\s*[-]?\s*([A-Z0-9]{1,3})\s*$/);
+    return m ? m[1] : 'A';
+  };
+
+  /** Point an assembly item at exactly one BOM, as master default. */
+  const replaceBoms = (itemId, bomId) => {
+    const item = record.load({ type: record.Type.ASSEMBLY_ITEM, id: itemId, isDynamic: true });
+    const s = 'billofmaterials';
+    for (let i = item.getLineCount({ sublistId: s }) - 1; i >= 0; i--) {
+      item.removeLine({ sublistId: s, line: i });
+    }
+    item.selectNewLine({ sublistId: s });
+    item.setCurrentSublistValue({ sublistId: s, fieldId: 'billofmaterials', value: bomId });
+    item.setCurrentSublistValue({ sublistId: s, fieldId: 'masterdefault', value: true });
+    item.commitLine({ sublistId: s });
+    item.save({ ignoreMandatoryFields: true });
+  };
+
+  const attachBom = (itemId, bomId, asMasterDefault) => {
+    const item = record.load({ type: record.Type.ASSEMBLY_ITEM, id: itemId, isDynamic: true });
+    const s = 'billofmaterials';
+    const n = item.getLineCount({ sublistId: s });
+    for (let i = 0; i < n; i++) {
+      item.selectLine({ sublistId: s, line: i });
+      if (String(item.getCurrentSublistValue({ sublistId: s, fieldId: 'billofmaterials' })) === String(bomId)) {
+        if (asMasterDefault) {
+          item.setCurrentSublistValue({ sublistId: s, fieldId: 'masterdefault', value: true });
+          item.commitLine({ sublistId: s });
+        }
+        item.save({ ignoreMandatoryFields: true });
+        return;
+      }
+    }
+    item.selectNewLine({ sublistId: s });
+    item.setCurrentSublistValue({ sublistId: s, fieldId: 'billofmaterials', value: bomId });
+    if (asMasterDefault) item.setCurrentSublistValue({ sublistId: s, fieldId: 'masterdefault', value: true });
+    item.commitLine({ sublistId: s });
+    item.save({ ignoreMandatoryFields: true });
+  };
+
+  // ------------------------------------------------------- routing plumbing
+  /**
+   * Move the live fab routing(s) off the parent BOM and onto the child BOM.
+   * Inactive routings and other subsidiaries (the "-TECH_ONLY" leftovers on
+   * subsidiary 4 / location 16) are deliberately left alone.
+   */
+  const repointRoutings = (fromBomId, toBomId) => {
+    const rows = query.runSuiteQL({
+      query: 'SELECT id, name FROM manufacturingrouting ' +
+             "WHERE billofmaterials = ? AND isinactive = 'F' AND subsidiary = ?",
+      params: [fromBomId, CFG.SUBSIDIARY]
+    }).asMappedResults();
+
+    const moved = [];
+    rows.forEach((r) => {
+      record.submitFields({
+        type: record.Type.MANUFACTURING_ROUTING,
+        id: r.id,
+        values: { billofmaterials: toBomId },
+        options: { ignoreMandatoryFields: true }
+      });
+      moved.push(r.id + ' (' + r.name + ')');
+    });
+    return moved;
+  };
+
+  const createRouting = (parentName, bomId, runRate) => {
+    const rt = record.create({ type: record.Type.MANUFACTURING_ROUTING, isDynamic: false });
+    rt.setValue({ fieldId: 'name', value: parentName + ' ROUTING' });
+    rt.setValue({ fieldId: 'billofmaterials', value: bomId });
+    rt.setValue({ fieldId: 'subsidiary', value: CFG.SUBSIDIARY });
+    rt.setValue({ fieldId: 'location', value: CFG.LOCATION });
+    rt.setValue({ fieldId: 'isdefault', value: true });
+    rt.setValue({ fieldId: 'autocalculatelag', value: false });
+
+    const s = 'routingstep';
+    rt.setSublistValue({ sublistId: s, fieldId: 'operationsequence', line: 0, value: CFG.PC_OP_SEQ });
+    rt.setSublistValue({ sublistId: s, fieldId: 'operationname', line: 0, value: CFG.PC_OP_NAME });
+    rt.setSublistValue({ sublistId: s, fieldId: 'manufacturingworkcenter', line: 0, value: CFG.PC_WORKCENTER });
+    rt.setSublistValue({ sublistId: s, fieldId: 'manufacturingcosttemplate', line: 0, value: CFG.PC_COST_TEMPLATE });
+    rt.setSublistValue({ sublistId: s, fieldId: 'setuptime', line: 0, value: CFG.PC_SETUP_TIME });
+    rt.setSublistValue({ sublistId: s, fieldId: 'runrate', line: 0, value: runRate });
+
+    return rt.save({ ignoreMandatoryFields: true });
+  };
+
+  // ---------------------------------------------------------------- helpers
+  const parseDate = (mdy) => {
+    if (mdy) {
+      try { return format.parse({ value: mdy, type: format.Type.DATE }); }
+      catch (e) { log.audit('Bad cutover date, using today', mdy); }
+    }
+    return new Date();
+  };
+
+  const addDays = (d, n) => {
+    const out = new Date(d.getTime());
+    out.setDate(out.getDate() + n);
+    return out;
+  };
+
+  // -------------------------------------------------------------- summarize
+  const summarize = (ctx) => {
+    const ok = [], failed = [];
+    ctx.output.iterator().each((key, value) => {
+      const r = JSON.parse(value);
+      (r.ok ? ok : failed).push(r);
+      return true;
+    });
+
+    try {
+      ctx.mapSummary.errors.iterator().each((k, e) => { log.error('Unhandled map error ' + k, e); return true; });
+    } catch (e) { /* no errors collection */ }
+
+    log.audit('Powder split finished', { succeeded: ok.length, failed: failed.length });
+
+    const lines = ['POWDER COAT SPLIT RESULTS',
+                   'Succeeded: ' + ok.length + '   Failed: ' + failed.length, ''];
+    ok.forEach((r) => {
+      const c = r.created;
+      lines.push('OK  ' + r.partNumber);
+      lines.push('      parent  ' + c.parentName + '  (item ' + c.parentId + ')');
+      lines.push('      child   ' + c.childName + '  (item ' + c.childId + ')');
+      lines.push('      parent BOM ' + c.parentBomId + '  new rev ' + c.parentRevisionId +
+                 ' "' + c.parentRevisionName + '"');
+      if (c.childBomId) lines.push('      child BOM  ' + c.childBomId + '  rev ' + c.childRevisionId);
+      if (c.routingsRepointed && c.routingsRepointed.length) {
+        lines.push('      repointed  ' + c.routingsRepointed.join(', '));
+      }
+      lines.push('      powder routing ' + c.routingId);
+      (r.notes || []).forEach((n) => lines.push('      ! ' + n));
+    });
+    failed.forEach((r) => lines.push('FAIL ' + r.partNumber + ': ' + r.error));
+
+    const body = lines.join('\n');
+    log.audit('Summary', body);
+
+    if (CFG.EMAIL_SUMMARY) {
+      try {
+        const me = runtime.getCurrentUser().id;
+        email.send({
+          author: me, recipients: me,
+          subject: 'Powder coat split: ' + ok.length + ' ok, ' + failed.length + ' failed',
+          body: body
+        });
+      } catch (e) {
+        log.error('Summary email failed', e);
+      }
+    }
+  };
+
+  return { getInputData, map, summarize };
+});
