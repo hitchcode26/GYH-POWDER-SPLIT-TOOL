@@ -47,7 +47,7 @@ define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
   // ---------------------------------------------------------------- config
   // Verified against PROD account 5262266 on 2026-08-04.
   const CFG = {
-    PARAM: 'custscript_gyh_pcs_payload',
+    PARAM: 'custscriptgyh_pcs_payload',  // confirmed on the Deployment Parameters tab in SB2 08/2026
 
     PC_OP_NAME: 'POWDERCOAT',   // 101798 used one word; older parts used "POWDER COAT"
     PC_OP_SEQ: 9,
