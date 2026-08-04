@@ -43,7 +43,27 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
 
   // ---------------------------------------------------------------- config
   const CFG = {
-    SUFFIX: ' - SV',                       // exactly as used in PROD
+    // The suffix is a COLOR CODE, not a fixed string. Derived from 479
+    // already-split parents in PROD: Silver Vein -> SV, Texture Black and
+    // Gloss Black -> BK, Gloss White -> WH, Textured Red -> RED. Both black
+    // powders share BK and both whites share WH, so the code comes from the
+    // color family rather than the phantom name.
+    //
+    // `text` is what gets appended to the descriptions, and it is NOT the
+    // phantom item's wording -- the phantom says "TEXTURE BLACK" but the
+    // descriptions read "Textured Black". Existing data is inconsistent about
+    // casing (SILVER VEIN vs Gloss White), so this uses the phantom's own
+    // uppercase form for consistency going forward.
+    COLORS: [
+      { match: 'SILVER VEIN',   code: 'SV',  text: 'SILVER VEIN' },
+      { match: 'TEXTURE BLACK', code: 'BK',  text: 'TEXTURED BLACK' },
+      { match: 'TEXTURED BLACK', code: 'BK', text: 'TEXTURED BLACK' },
+      { match: 'GLOSS BLACK',   code: 'BK',  text: 'GLOSS BLACK' },
+      { match: 'GLOSS WHITE',   code: 'WH',  text: 'GLOSS WHITE' },
+      { match: 'TEXTURED WHITE', code: 'WH', text: 'TEXTURED WHITE' },
+      { match: 'TEXTURED RED',  code: 'RED', text: 'TEXTURED RED' }
+    ],
+    SUFFIX_SEP: ' - ',                     // "104655" + " - " + "BK"
     PHANTOM_PREFIX: 'PRIME AND POWDER',
     DEFAULT_HANGERS: 0.5,
     // Hanger qty drives BOTH the phantom BOM quantity and the routing run
@@ -152,10 +172,18 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
     if (!rows.length) return [];
 
     // look up the part and its future " - SV" name, to catch re-runs
+    // Look up the part plus its possible coated names. The suffix depends on
+    // the chosen color, so probe every code (SV/BK/WH/RED) to catch parts that
+    // are already split in ANY color.
+    const codes = [];
+    CFG.COLORS.forEach((c) => { if (codes.indexOf(c.code) === -1) codes.push(c.code); });
+
     const names = [];
     rows.forEach((r) => {
       const p = String(r.partNumber || '').trim();
-      if (p) { names.push(p.toUpperCase()); names.push((p + CFG.SUFFIX).toUpperCase()); }
+      if (!p) return;
+      names.push(p.toUpperCase());
+      codes.forEach((code) => { names.push((p + CFG.SUFFIX_SEP + code).toUpperCase()); });
     });
 
     const itemsByName = {}, itemsById = {};
@@ -235,11 +263,13 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
     return rows.map((r) => {
       const part = String(r.partNumber || '').trim();
       const color = colorIds[String(r.phantomItemId)];
+      const res = color ? resolveColor(color.itemid) : { code: null, text: '' };
       const out = {
         partNumber: part,
-        parentName: part + CFG.SUFFIX,
+        colorCode: res.code,
+        colorText: res.text,
+        parentName: res.code ? (part + CFG.SUFFIX_SEP + res.code) : part,
         phantomItemId: r.phantomItemId,
-        colorLabel: color ? colorLabel(color.itemid) : '',
         hangers: Number(r.hangers) || CFG.DEFAULT_HANGERS,
         cutoverDate: cutoverDate || '',
         itemInternalId: null,
@@ -251,6 +281,11 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
       const warn = (m) => { if (out.status !== 'error') out.status = 'warn'; out.messages.push(m); };
 
       if (!part) { err('Part number is blank.'); return out; }
+      if (!color) { err('Pick a color.'); return out; }
+      if (!res.code) {
+        err('No suffix code is mapped for "' + res.raw + '". Add it to CFG.COLORS.');
+        return out;
+      }
 
       const item = itemsByName[part.toUpperCase()];
       if (!item) { err('No item found with this name/number.'); return out; }
@@ -260,8 +295,13 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
         err('Item type is ' + item.itemtype + '. Only Assembly items can be split.');
       }
       if (String(item.isinactive) === 'T') err('Item is inactive.');
-      if (part.toUpperCase().endsWith(CFG.SUFFIX.trim().toUpperCase())) {
-        err('Already ends in "' + CFG.SUFFIX.trim() + '" -- looks like it was split already.');
+
+      // Already carries any color code? Then it is a coated parent already.
+      const already = codes.filter((code) =>
+        part.toUpperCase().endsWith((CFG.SUFFIX_SEP + code).toUpperCase().replace(/\s+/g, ' ')) ||
+        part.toUpperCase().replace(/\s+/g, ' ').endsWith('- ' + code));
+      if (already.length) {
+        err('Already ends in "- ' + already[0] + '" -- looks like it was split already.');
       }
 
       const clash = itemsByName[out.parentName.toUpperCase()];
@@ -303,7 +343,6 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
         warn('No master-default BOM. A powder BOM will be built from scratch and the child will have none.');
       }
 
-      if (!color) err('Pick a color.');
       if (!(out.hangers > 0)) err('Hanger qty must be greater than zero.');
 
       const wo = openWoByItem[String(item.id)];
@@ -327,7 +366,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
       resume: !!r.resume,
       parentName: r.parentName,
       phantomItemId: r.phantomItemId,
-      colorLabel: r.colorLabel,
+      colorCode: r.colorCode,
+      colorText: r.colorText,
       hangers: r.hangers,          // MR uses this for BOM qty and run rate alike
       fabBomId: r.fabBomId,
       fabRevId: r.fabRevId,
@@ -366,13 +406,25 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
     }
   };
 
-  /** "PRIME AND POWDER COAT SILVER VEIN (PER HANGER)" -> "SILVER VEIN" */
-  const colorLabel = (itemid) => String(itemid || '')
-    .toUpperCase()
-    .replace(/^PRIME\s+AND\s+POWDER\s*-?\s*COAT\s*/, '')
-    .replace(/\(PER\s+HANGER\)/, '')
-    .replace(/\s+/g, ' ')
-    .trim();
+  /**
+   * Resolve a phantom item name to its suffix code and description wording.
+   * "PRIME AND POWDER COAT TEXTURE BLACK (PER HANGER)" -> BK / "TEXTURED BLACK"
+   */
+  const resolveColor = (itemid) => {
+    const raw = String(itemid || '')
+      .toUpperCase()
+      .replace(/^PRIME\s+AND\s+POWDER\s*-?\s*COAT\s*/, '')
+      .replace(/\(PER\s+HANGER\)/, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    for (let i = 0; i < CFG.COLORS.length; i++) {
+      if (raw.indexOf(CFG.COLORS[i].match) !== -1) {
+        return { code: CFG.COLORS[i].code, text: CFG.COLORS[i].text, raw: raw };
+      }
+    }
+    return { code: null, text: raw, raw: raw };   // unmapped -> validation errors
+  };
 
   /** "101798 REV F" -> "F" */
   const revLetter = (revName) => {
@@ -386,15 +438,18 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
   // CSS/JS can't touch anything outside it, and the only thing reaching
   // outside that div is the one rule that hides NetSuite's own title band.
   const renderPage = () => {
-    const colors = getColors().map((c) => ({ id: c.id, label: c.itemid }));
+    const colors = getColors().map((c) => {
+      const res = resolveColor(c.itemid);
+      return { id: c.id, label: c.itemid, code: res.code || '?' };
+    });
     const W = CFG.WRAPPER_ID;
 
     return '<style>' + css(W) + '</style>' +
       '<div id="' + W + '">' +
         '<header><h1>Add Powder Coat Step to Parts</h1>' +
-        '<p class="sub">Renames each part to <code>&lt;part&gt;' + esc(CFG.SUFFIX) + '</code> as the ' +
-        'coated parent, copies it back out under the original number as the bare child, then rebuilds ' +
-        'the BOMs and routings the same way 101798 was done.</p></header>' +
+        '<p class="sub">Renames each part to <code>&lt;part&gt; - &lt;color code&gt;</code> ' +
+        '(SV / BK / WH / RED) as the coated parent, copies it back out under the original number ' +
+        'as the bare child, then rebuilds the BOMs and routings the same way 101798 was done.</p></header>' +
 
         '<section class="card">' +
           '<h2>1 &middot; Load part numbers</h2>' +
@@ -435,13 +490,13 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
           '<p class="hint">The old fab revision is end-dated the day before the cutover date and the ' +
           'new powder revision starts on it.</p>' +
           '<p class="warn"><b>This cannot be undone from here.</b> Run it in SB2 first. ' +
-          'On-hand stays on the parent, which is now the coated <code>' + esc(CFG.SUFFIX.trim()) +
-          '</code> item, and the child starts at zero &mdash; move stock by hand if what is physically ' +
+          'On-hand stays on the parent, which is now the coated color-coded item, ' +
+          'and the child starts at zero &mdash; move stock by hand if what is physically ' +
           'on the shelf is bare. Vendor records and purchase prices also stay on the parent.</p>' +
         '</section>' +
       '</div>' +
       '<script>(function(){' +
-      'var COLORS=' + JSON.stringify(colors) + ';var SUFFIX=' + JSON.stringify(CFG.SUFFIX) +
+      'var COLORS=' + JSON.stringify(colors) + ';var SEP=' + JSON.stringify(CFG.SUFFIX_SEP) +
       ';var MAXROWS=' + CFG.MAX_ROWS + ';var WRAP=' + JSON.stringify(W) + ';' +
       clientJs() + '})();</script>';
   };
@@ -464,21 +519,29 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
     '(function(){var d=new Date();$("#cutover").value=',
     '(d.getMonth()+1)+"/"+d.getDate()+"/"+d.getFullYear();})();',
 
+    'function codeFor(colorId){for(var i=0;i<COLORS.length;i++){',
+    'if(String(COLORS[i].id)===String(colorId))return COLORS[i].code;}return "";}',
+
+    'function rowName(tr){var v=tr.querySelector(".p").value.trim();',
+    'var code=codeFor(tr.querySelector(".c").value);',
+    'return (v&&code)?(v+SEP+code):"";}',
+
+    'function refreshName(tr){tr.querySelector(".pn").textContent=rowName(tr);dirty();}',
+
     'function addRow(part,color,hangers){var tb=$("#body");',
     'if(tb.rows.length>=MAXROWS){alert("Max "+MAXROWS+" rows per run.");return;}',
     'var tr=tb.insertRow();tr.innerHTML=',
     '"<td><input class=\'p\' value=\'"+(part||"")+"\' oninput=\'gyhPS_syncName(this)\'></td>"+',
-    '"<td class=\'pn mono\'>"+(part?part+SUFFIX:"")+"</td>"+',
-    '"<td><select class=\'c\'>"+colorOpts(color)+"</select></td>"+',
+    '"<td class=\'pn mono\'></td>"+',
+    '"<td><select class=\'c\' onchange=\'gyhPS_syncName(this)\'>"+colorOpts(color)+"</select></td>"+',
     '"<td><input class=\'h\' type=\'number\' step=\'0.01\' min=\'0\' value=\'"+(hangers||"")+"\'></td>"+',
     '"<td class=\'st\'></td>"+',
     '"<td><button type=\'button\' class=\'x\' onclick=\'gyhPS_removeRow(this)\'>&times;</button></td>";',
-    'dirty();}',
+    'refreshName(tr);}',
 
     'function removeRow(btn){btn.closest("tr").remove();dirty();}',
 
-    'function syncName(el){var tr=el.closest("tr");var v=el.value.trim();',
-    'tr.querySelector(".pn").textContent=v?v+SUFFIX:"";dirty();}',
+    'function syncName(el){refreshName(el.closest("tr"));}',
 
     'function addBulk(){var txt=$("#bulk").value;',
     'var c=$("#defColor").value;',
