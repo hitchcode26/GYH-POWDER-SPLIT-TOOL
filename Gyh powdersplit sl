@@ -55,9 +55,59 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
 
     WRAPPER_ID: 'gyhPowderSplit',          // every custom CSS/JS rule is scoped under this
 
-    MR_SCRIPT_ID: 'customscript5496',      // confirmed on the Script record in SB2 08/2026
-    MR_DEPLOY_ID: 'customdeploy1',         // confirmed on the Deployment record in SB2 08/2026
-    MR_PARAM: 'custscriptgyh_pcs_payload'  // confirmed on the Deployment Parameters tab in SB2 08/2026
+    // Deployment targets are resolved BY NAME at runtime (see resolveMrTarget
+    // below) so this file is identical in SB2 and PROD. NetSuite auto-assigns
+    // script/deployment/parameter IDs on first save and they differ per
+    // account -- hardcoding them is what caused the INVALID_ID and
+    // "No payload" failures during the SB2 rollout. The values below are only
+    // fallbacks used if the name lookup comes back empty.
+    MR_SCRIPT_NAME: 'GYH_PowderSplit_MR',
+    MR_PARAM_LABEL: 'Powder Split Payload',
+    MR_SCRIPT_ID_FALLBACK: 'customscript5496',
+    MR_DEPLOY_ID_FALLBACK: 'customdeploy1',
+    MR_PARAM_FALLBACK: 'custscriptgyh_pcs_payload'
+  };
+
+  /**
+   * Look up the Map/Reduce script, its deployment, and its payload parameter
+   * by name. Returns lowercase script IDs ready for task.create().
+   */
+  const resolveMrTarget = () => {
+    const out = {
+      scriptId: CFG.MR_SCRIPT_ID_FALLBACK,
+      deployId: CFG.MR_DEPLOY_ID_FALLBACK,
+      paramId: CFG.MR_PARAM_FALLBACK,
+      resolved: false
+    };
+
+    try {
+      const r = query.runSuiteQL({
+        query: 'SELECT s.scriptid AS sid, d.scriptid AS did FROM script s ' +
+               'JOIN scriptdeployment d ON d.script = s.id ' +
+               'WHERE UPPER(s.name) = ? AND ROWNUM <= 1',
+        params: [String(CFG.MR_SCRIPT_NAME).toUpperCase()]
+      }).asMappedResults();
+      if (r.length && r[0].sid && r[0].did) {
+        out.scriptId = String(r[0].sid).toLowerCase();
+        out.deployId = String(r[0].did).toLowerCase();
+        out.resolved = true;
+      }
+    } catch (e) {
+      log.audit('MR script/deployment lookup failed; using fallbacks', e.message);
+    }
+
+    try {
+      const p = query.runSuiteQL({
+        query: 'SELECT scriptid FROM customfield ' +
+               "WHERE fieldtype = 'SCRIPT' AND UPPER(name) = ? AND ROWNUM <= 1",
+        params: [String(CFG.MR_PARAM_LABEL).toUpperCase()]
+      }).asMappedResults();
+      if (p.length && p[0].scriptid) out.paramId = String(p[0].scriptid).toLowerCase();
+    } catch (e) {
+      log.audit('MR parameter lookup failed; using fallback', e.message);
+    }
+
+    return out;
   };
 
   // ------------------------------------------------------------ entry point
@@ -284,14 +334,20 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
       cutoverDate: cutoverDate || ''
     }));
 
+    const target = resolveMrTarget();
+
     const t = task.create({ taskType: task.TaskType.MAP_REDUCE });
-    t.scriptId = CFG.MR_SCRIPT_ID;
-    t.deploymentId = CFG.MR_DEPLOY_ID;
+    t.scriptId = target.scriptId;
+    t.deploymentId = target.deployId;
     t.params = {};
-    t.params[CFG.MR_PARAM] = JSON.stringify(payload);
+    t.params[target.paramId] = JSON.stringify(payload);
 
     const taskId = t.submit();
-    log.audit('Powder split queued', { taskId: taskId, count: payload.length, user: runtime.getCurrentUser().id });
+    log.audit('Powder split queued', {
+      taskId: taskId, count: payload.length, user: runtime.getCurrentUser().id,
+      script: target.scriptId, deployment: target.deployId, param: target.paramId,
+      resolvedByName: target.resolved
+    });
     return { ok: true, taskId: taskId, count: payload.length };
   };
 
