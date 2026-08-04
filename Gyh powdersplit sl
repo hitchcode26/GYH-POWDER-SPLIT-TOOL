@@ -190,7 +190,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
     if (names.length) {
       const ph = names.map(() => '?').join(',');
       query.runSuiteQL({
-        query: 'SELECT id, itemid, displayname, itemtype, isinactive, costestimatetype ' +
+        query: 'SELECT id, itemid, displayname, description, itemtype, isinactive, costestimatetype ' +
                'FROM item WHERE UPPER(itemid) IN (' + ph + ')',
         params: names
       }).asMappedResults().forEach((i) => {
@@ -318,7 +318,24 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
         String(parentBom.billofmaterials) === String(childBom.billofmaterials);
 
       if (clash && !resumable) {
-        err('"' + out.parentName + '" already exists (internal ID ' + clash.id + ').');
+        // Fully split already (parent and child own different BOMs). Not an
+        // error if the only thing missing is the color wording -- offer a
+        // descriptions-only back-fill instead of blocking, since parts split
+        // before the color fix landed can't otherwise be corrected here.
+        const parentDesc = [clash.displayname, clash.description]
+          .map((s) => String(s || '').toUpperCase()).join(' | ');
+        const hasColor = res.text && parentDesc.indexOf(res.text.toUpperCase()) !== -1;
+
+        if (!hasColor && res.text) {
+          out.mode = 'descriptions';
+          out.parentInternalId = clash.id;
+          warn('Already split. "' + res.text + '" is missing from the descriptions on "' +
+               out.parentName + '" -- this run will only append the color, and will not touch ' +
+               'items, BOMs or routings.');
+        } else {
+          err('"' + out.parentName + '" already exists (internal ID ' + clash.id + ') and already ' +
+              'carries "' + res.text + '". Nothing to do.');
+        }
       } else if (resumable) {
         out.resume = true;
         out.parentInternalId = clash.id;
@@ -326,6 +343,10 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
              'its BOM with this item -- looks like a prior attempt died mid-way. This run will pick up ' +
              'at the BOM/routing rebuild and skip renaming or copying again.');
       }
+
+      // In descriptions-only mode nothing structural is touched, so BOM,
+      // routing and hanger checks are irrelevant.
+      if (out.mode === 'descriptions') return out;
 
       const bom = resumable ? parentBom : childBom;
       if (bom) {
@@ -364,6 +385,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
       itemInternalId: r.itemInternalId,
       parentInternalId: r.parentInternalId || null,
       resume: !!r.resume,
+      mode: r.mode || 'split',
       parentName: r.parentName,
       phantomItemId: r.phantomItemId,
       colorCode: r.colorCode,
@@ -568,6 +590,9 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
     '.catch(function(e){b.disabled=false;setMsg("Request failed: "+e,"e");});}',
 
     'function plan(r){var p=[];',
+    'if(r.mode==="descriptions"){p.push("<b>DESCRIPTIONS ONLY</b>: append the color to <span class=\'mono\'>"',
+    '+r.parentName+"</span>, strip it from <span class=\'mono\'>"+r.partNumber+"</span>");',
+    'return "<div class=\'plan\'>"+p.join(" &middot; ")+"</div>";}',
     'if(r.resume){p.push("<b>RESUME</b>: rename+copy already done, finishing BOM/routing only");}',
     'if(r.fabBomName){p.push("BOM <span class=\'mono\'>"+r.fabBomName+"</span> renamed, rev <span class=\'mono\'>"',
     '+(r.fabRevName||"?")+"</span> closed, <span class=\'mono\'>"+r.newRevName+"</span> added");',
