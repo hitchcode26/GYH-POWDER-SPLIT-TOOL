@@ -30,11 +30,16 @@
  *          with a single op: seq 9, POWDERCOAT, Hitch - Powder Coating,
  *          PRIME AND POWDER-COAT (COST PER HANGER).
  *
+ * UI: built as an N/ui/serverWidget Form with a single INLINEHTML field
+ * carrying the whole dashboard (markup + scoped CSS + JS), rendered via
+ * response.writePage(). Nothing is written to the response as raw HTML.
+ *
  * @NApiVersion 2.1
  * @NScriptType Suitelet
  * @NModuleScope SameAccount
  */
-define(['N/query', 'N/task', 'N/runtime', 'N/log'], (query, task, runtime, log) => {
+define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
+(serverWidget, query, task, runtime, log) => {
 
   // ---------------------------------------------------------------- config
   const CFG = {
@@ -48,8 +53,10 @@ define(['N/query', 'N/task', 'N/runtime', 'N/log'], (query, task, runtime, log) 
     SUBSIDIARY: 2,
     MAX_ROWS: 100,
 
-    MR_SCRIPT_ID: 'customscript_gyh_powdersplit_mr',
-    MR_DEPLOY_ID: 'customdeploy_gyh_powdersplit_mr',
+    WRAPPER_ID: 'gyhPowderSplit',          // every custom CSS/JS rule is scoped under this
+
+    MR_SCRIPT_ID: 'customscript5496',      // confirmed on the Script record in SB2 08/2026
+    MR_DEPLOY_ID: 'customdeploy1',         // confirmed on the Deployment record in SB2 08/2026
     MR_PARAM: 'custscript_gyh_pcs_payload'
   };
 
@@ -57,7 +64,7 @@ define(['N/query', 'N/task', 'N/runtime', 'N/log'], (query, task, runtime, log) 
   const onRequest = (ctx) => {
     const req = ctx.request, res = ctx.response;
 
-    if (req.method === 'GET') { res.write(renderPage()); return; }
+    if (req.method === 'GET') { res.writePage(buildForm()); return; }
 
     res.setHeader({ name: 'Content-Type', value: 'application/json' });
     let out;
@@ -71,6 +78,22 @@ define(['N/query', 'N/task', 'N/runtime', 'N/log'], (query, task, runtime, log) 
       out = { ok: false, error: e.message || String(e) };
     }
     res.write(JSON.stringify(out));
+  };
+
+  // ---------------------------------------------------------- form / widget
+  const buildForm = () => {
+    const form = serverWidget.createForm({ title: 'Add Powder Coat Step to Parts' });
+
+    const field = form.addField({
+      id: 'custpage_gyh_powdersplit_html',
+      type: serverWidget.FieldType.INLINEHTML,
+      label: 'Dashboard'
+    });
+    field.updateLayoutType({ layoutType: serverWidget.FieldLayoutType.OUTSIDEBELOW });
+    field.updateBreakType({ breakType: serverWidget.FieldBreakType.STARTROW });
+    field.defaultValue = renderPage();
+
+    return form;
   };
 
   // ------------------------------------------------------------- validation
@@ -279,12 +302,16 @@ define(['N/query', 'N/task', 'N/runtime', 'N/log'], (query, task, runtime, log) 
   };
 
   // ------------------------------------------------------------------- view
+  // Returns ONLY the scoped fragment that goes into the INLINEHTML field --
+  // no <html>/<head>/<body>. Everything is nested inside #WRAPPER_ID so the
+  // CSS/JS can't touch anything outside it, and the only thing reaching
+  // outside that div is the one rule that hides NetSuite's own title band.
   const renderPage = () => {
     const colors = getColors().map((c) => ({ id: c.id, label: c.itemid }));
-    return '<!DOCTYPE html><html><head><meta charset="utf-8">' +
-      '<meta name="viewport" content="width=device-width,initial-scale=1">' +
-      '<title>Add Powder Coat Step</title><style>' + css() + '</style></head><body>' +
-      '<div class="wrap">' +
+    const W = CFG.WRAPPER_ID;
+
+    return '<style>' + css(W) + '</style>' +
+      '<div id="' + W + '">' +
         '<header><h1>Add Powder Coat Step to Parts</h1>' +
         '<p class="sub">Renames each part to <code>&lt;part&gt;' + esc(CFG.SUFFIX) + '</code> as the ' +
         'coated parent, copies it back out under the original number as the bare child, then rebuilds ' +
@@ -298,15 +325,15 @@ define(['N/query', 'N/task', 'N/runtime', 'N/log'], (query, task, runtime, log) 
               '<label>Default color</label><select id="defColor"></select>' +
               '<label>Default hangers / unit</label>' +
               '<input id="defHangers" type="number" step="0.01" min="0" value="' + CFG.DEFAULT_HANGERS + '">' +
-              '<button class="btn" onclick="addBulk()">Add to grid</button>' +
+              '<button class="btn" onclick="gyhPS_addBulk()">Add to grid</button>' +
             '</div>' +
           '</div>' +
         '</section>' +
 
         '<section class="card">' +
           '<div class="cardhead"><h2>2 &middot; Review rows</h2>' +
-            '<div><button class="btn ghost" onclick="addRow()">+ Row</button>' +
-            '<button class="btn ghost" onclick="clearRows()">Clear</button></div></div>' +
+            '<div><button class="btn ghost" onclick="gyhPS_addRow()">+ Row</button>' +
+            '<button class="btn ghost" onclick="gyhPS_clearRows()">Clear</button></div></div>' +
           '<table><thead><tr>' +
             '<th style="width:15%">Part number</th>' +
             '<th style="width:14%">Becomes parent</th>' +
@@ -322,8 +349,8 @@ define(['N/query', 'N/task', 'N/runtime', 'N/log'], (query, task, runtime, log) 
           '<h2>3 &middot; Validate, then commit</h2>' +
           '<div class="actions">' +
             '<label class="inline">Cutover date <input id="cutover" type="text" placeholder="m/d/yyyy" style="width:110px"></label>' +
-            '<button class="btn" id="btnVal" onclick="doValidate()">Validate (read only)</button>' +
-            '<button class="btn go" id="btnGo" onclick="doCommit()" disabled>Commit split</button>' +
+            '<button class="btn" id="btnVal" onclick="gyhPS_doValidate()">Validate (read only)</button>' +
+            '<button class="btn go" id="btnGo" onclick="gyhPS_doCommit()" disabled>Commit split</button>' +
             '<span id="msg" class="msg"></span>' +
           '</div>' +
           '<p class="hint">The old fab revision is end-dated the day before the cutover date and the ' +
@@ -334,52 +361,65 @@ define(['N/query', 'N/task', 'N/runtime', 'N/log'], (query, task, runtime, log) 
           'on the shelf is bare. Vendor records and purchase prices also stay on the parent.</p>' +
         '</section>' +
       '</div>' +
-      '<script>var COLORS=' + JSON.stringify(colors) + ';var SUFFIX=' + JSON.stringify(CFG.SUFFIX) +
-      ';var MAXROWS=' + CFG.MAX_ROWS + ';' + clientJs() + '</script></body></html>';
+      '<script>(function(){' +
+      'var COLORS=' + JSON.stringify(colors) + ';var SUFFIX=' + JSON.stringify(CFG.SUFFIX) +
+      ';var MAXROWS=' + CFG.MAX_ROWS + ';var WRAP=' + JSON.stringify(W) + ';' +
+      clientJs() + '})();</script>';
   };
 
+  // All lookups are scoped to the wrapper div (ROOT), never bare
+  // document.getElementById, so nothing here can touch or be shadowed by
+  // NetSuite's own page elements. The five entry points referenced from
+  // inline onclick= attributes are hung on window with a gyhPS_ prefix so
+  // they resolve from outside this IIFE's closure; everything else stays
+  // private inside it.
   const clientJs = () => [
+    'var ROOT=document.getElementById(WRAP);',
+    'function $(sel){return ROOT.querySelector(sel);}',
+
     'function colorOpts(sel){var s="<option value=\'\'>-- select --</option>";',
     'for(var i=0;i<COLORS.length;i++){s+="<option value=\'"+COLORS[i].id+"\'"+',
     '(String(sel)===String(COLORS[i].id)?" selected":"")+">"+COLORS[i].label+"</option>";}return s;}',
 
-    'document.getElementById("defColor").innerHTML=colorOpts("");',
-    '(function(){var d=new Date();document.getElementById("cutover").value=',
+    '$("#defColor").innerHTML=colorOpts("");',
+    '(function(){var d=new Date();$("#cutover").value=',
     '(d.getMonth()+1)+"/"+d.getDate()+"/"+d.getFullYear();})();',
 
-    'function addRow(part,color,hangers){var tb=document.getElementById("body");',
+    'function addRow(part,color,hangers){var tb=$("#body");',
     'if(tb.rows.length>=MAXROWS){alert("Max "+MAXROWS+" rows per run.");return;}',
     'var tr=tb.insertRow();tr.innerHTML=',
-    '"<td><input class=\'p\' value=\'"+(part||"")+"\' oninput=\'syncName(this)\'></td>"+',
+    '"<td><input class=\'p\' value=\'"+(part||"")+"\' oninput=\'gyhPS_syncName(this)\'></td>"+',
     '"<td class=\'pn mono\'>"+(part?part+SUFFIX:"")+"</td>"+',
     '"<td><select class=\'c\'>"+colorOpts(color)+"</select></td>"+',
     '"<td><input class=\'h\' type=\'number\' step=\'0.01\' min=\'0\' value=\'"+(hangers||"")+"\'></td>"+',
     '"<td class=\'st\'></td>"+',
-    '"<td><button class=\'x\' onclick=\'this.closest(\\"tr\\").remove();dirty()\'>&times;</button></td>";',
+    '"<td><button class=\'x\' onclick=\'gyhPS_removeRow(this)\'>&times;</button></td>";',
     'dirty();}',
+
+    'function removeRow(btn){btn.closest("tr").remove();dirty();}',
 
     'function syncName(el){var tr=el.closest("tr");var v=el.value.trim();',
     'tr.querySelector(".pn").textContent=v?v+SUFFIX:"";dirty();}',
 
-    'function addBulk(){var txt=document.getElementById("bulk").value;',
-    'var c=document.getElementById("defColor").value;',
-    'var h=document.getElementById("defHangers").value;',
+    'function addBulk(){var txt=$("#bulk").value;',
+    'var c=$("#defColor").value;',
+    'var h=$("#defHangers").value;',
     'var lines=txt.split(/[\\r\\n,;\\t]+/);var n=0;',
     'for(var i=0;i<lines.length;i++){var p=lines[i].trim();if(p){addRow(p,c,h);n++;}}',
-    'document.getElementById("bulk").value="";',
+    '$("#bulk").value="";',
     'if(!n)setMsg("Nothing to add.","e");else setMsg(n+" row(s) added.","");}',
 
-    'function clearRows(){document.getElementById("body").innerHTML="";dirty();}',
+    'function clearRows(){$("#body").innerHTML="";dirty();}',
 
-    'function collect(){var out=[];var rows=document.getElementById("body").rows;',
+    'function collect(){var out=[];var rows=$("#body").rows;',
     'for(var i=0;i<rows.length;i++){var t=rows[i];out.push({partNumber:t.querySelector(".p").value.trim(),',
     'phantomItemId:t.querySelector(".c").value,',
     'hangers:t.querySelector(".h").value});}return out;}',
 
-    'function dirty(){document.getElementById("btnGo").disabled=true;}',
-    'function setMsg(m,k){var e=document.getElementById("msg");e.textContent=m;e.className="msg "+(k||"");}',
+    'function dirty(){$("#btnGo").disabled=true;}',
+    'function setMsg(m,k){var e=$("#msg");e.textContent=m;e.className="msg "+(k||"");}',
 
-    'function post(body,cb){var b=document.getElementById("btnVal"),g=document.getElementById("btnGo");',
+    'function post(body,cb){var b=$("#btnVal"),g=$("#btnGo");',
     'b.disabled=true;g.disabled=true;',
     'fetch(window.location.href,{method:"POST",headers:{"Content-Type":"application/json"},',
     'body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(d){b.disabled=false;cb(d);})',
@@ -396,60 +436,84 @@ define(['N/query', 'N/task', 'N/runtime', 'N/log'], (query, task, runtime, log) 
 
     'function doValidate(){var rows=collect();if(!rows.length){setMsg("Add some part numbers first.","e");return;}',
     'setMsg("Validating...","");',
-    'post({action:"validate",rows:rows,cutoverDate:document.getElementById("cutover").value},function(d){',
+    'post({action:"validate",rows:rows,cutoverDate:$("#cutover").value},function(d){',
     'if(!d.ok){setMsg(d.error||"Validation failed.","e");return;}',
-    'var tb=document.getElementById("body").rows;var errs=0,warns=0;',
+    'var tb=$("#body").rows;var errs=0,warns=0;',
     'for(var i=0;i<d.rows.length;i++){var r=d.rows[i];var cell=tb[i].querySelector(".st");',
     'if(r.status==="error"){errs++;cell.innerHTML="<span class=\'bad\'>ERROR</span> "+r.messages.join(" ");}',
     'else if(r.status==="warn"){warns++;cell.innerHTML="<span class=\'wrn\'>CHECK</span> "+r.messages.join(" ")+plan(r);}',
     'else{cell.innerHTML="<span class=\'good\'>READY</span>"+plan(r);}}',
     'if(errs){setMsg(errs+" error(s) -- fix before committing.","e");}',
-    'else{document.getElementById("btnGo").disabled=false;',
+    'else{$("#btnGo").disabled=false;',
     'setMsg("Ready: "+d.rows.length+" part(s)"+(warns?", "+warns+" with warnings":"")+".","g");}});}',
 
     'function doCommit(){var rows=collect();',
     'if(!confirm("Split "+rows.length+" part(s)? This renames live item and BOM records and cannot be undone here."))return;',
     'setMsg("Submitting...","");',
-    'post({action:"commit",rows:rows,cutoverDate:document.getElementById("cutover").value},function(d){',
+    'post({action:"commit",rows:rows,cutoverDate:$("#cutover").value},function(d){',
     'if(!d.ok){setMsg(d.error||"Commit failed.","e");return;}',
     'setMsg("Queued "+d.count+" part(s). Map/Reduce task "+d.taskId+". Watch the Script Execution Log.","g");});}',
+
+    // exposed entry points for the inline onclick= handlers in the markup above
+    'window.gyhPS_addRow=function(){addRow();};',
+    'window.gyhPS_addBulk=addBulk;',
+    'window.gyhPS_clearRows=clearRows;',
+    'window.gyhPS_removeRow=removeRow;',
+    'window.gyhPS_syncName=syncName;',
+    'window.gyhPS_doValidate=doValidate;',
+    'window.gyhPS_doCommit=doCommit;',
 
     'addRow();'
   ].join('');
 
-  const css = () => [
-    '*{box-sizing:border-box}body{margin:0;font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;',
-    'background:#f4f5f7;color:#1f2430}.wrap{max-width:1240px;margin:0 auto;padding:20px}',
-    'header h1{margin:0 0 4px;font-size:21px}header .sub{margin:0 0 18px;color:#667;max-width:900px}',
-    '.card{background:#fff;border:1px solid #e2e5ea;border-radius:8px;padding:16px;margin-bottom:14px}',
-    '.card h2{margin:0 0 12px;font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:#5a6474}',
-    '.cardhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}',
-    '.cardhead h2{margin:0}',
-    '.bulk{display:flex;gap:14px}.bulk textarea{flex:1;padding:8px;border:1px solid #ccd2da;border-radius:6px;',
+  // All selectors are prefixed with #WRAPPER_ID so nothing here can leak
+  // onto or collide with the surrounding NetSuite page. The one exception
+  // is .uir-page-title, which is NetSuite's own page-title band -- that
+  // single global rule just hides it for a cleaner look; nothing else
+  // outside the wrapper is touched.
+  const css = (w) => [
+    '.uir-page-title{display:none}',
+
+    '#' + w + '{box-sizing:border-box;font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;',
+    'background:#f4f5f7;color:#1f2430;max-width:1240px;margin:0 auto;padding:20px}',
+    '#' + w + ' *{box-sizing:border-box}',
+    '#' + w + ' header h1{margin:0 0 4px;font-size:21px}',
+    '#' + w + ' header .sub{margin:0 0 18px;color:#667;max-width:900px}',
+    '#' + w + ' .card{background:#fff;border:1px solid #e2e5ea;border-radius:8px;padding:16px;margin-bottom:14px}',
+    '#' + w + ' .card h2{margin:0 0 12px;font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:#5a6474}',
+    '#' + w + ' .cardhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}',
+    '#' + w + ' .cardhead h2{margin:0}',
+    '#' + w + ' .bulk{display:flex;gap:14px}',
+    '#' + w + ' .bulk textarea{flex:1;padding:8px;border:1px solid #ccd2da;border-radius:6px;',
     'font:12px/1.4 ui-monospace,Menlo,Consolas,monospace;resize:vertical}',
-    '.bulkside{width:250px;display:flex;flex-direction:column;gap:4px}',
-    '.bulkside label{font-size:11px;color:#667;text-transform:uppercase;letter-spacing:.04em}',
-    'select,input{padding:6px 7px;border:1px solid #ccd2da;border-radius:5px;font:inherit;width:100%;background:#fff}',
-    'table{width:100%;border-collapse:collapse}',
-    'th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:#5a6474;',
+    '#' + w + ' .bulkside{width:250px;display:flex;flex-direction:column;gap:4px}',
+    '#' + w + ' .bulkside label{font-size:11px;color:#667;text-transform:uppercase;letter-spacing:.04em}',
+    '#' + w + ' select,#' + w + ' input{padding:6px 7px;border:1px solid #ccd2da;border-radius:5px;font:inherit;width:100%;background:#fff}',
+    '#' + w + ' table{width:100%;border-collapse:collapse}',
+    '#' + w + ' th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:#5a6474;',
     'padding:6px;border-bottom:1px solid #e2e5ea}',
-    'td{padding:5px 6px;border-bottom:1px solid #f0f2f5;vertical-align:middle}',
-    '.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}',
-    '.pn{color:#2b6cb0}.st{font-size:12px;color:#556}',
-    '.plan{margin-top:3px;color:#4a5568;font-size:11.5px}',
-    '.btn{padding:7px 13px;border:1px solid #2b6cb0;background:#2b6cb0;color:#fff;border-radius:6px;',
+    '#' + w + ' td{padding:5px 6px;border-bottom:1px solid #f0f2f5;vertical-align:middle}',
+    '#' + w + ' .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}',
+    '#' + w + ' .pn{color:#2b6cb0}',
+    '#' + w + ' .st{font-size:12px;color:#556}',
+    '#' + w + ' .plan{margin-top:3px;color:#4a5568;font-size:11.5px}',
+    '#' + w + ' .btn{padding:7px 13px;border:1px solid #2b6cb0;background:#2b6cb0;color:#fff;border-radius:6px;',
     'cursor:pointer;font:inherit;font-weight:600}',
-    '.btn.ghost{background:#fff;color:#2b6cb0;margin-left:6px}',
-    '.btn.go{background:#1f7a4d;border-color:#1f7a4d}',
-    '.btn:disabled{opacity:.45;cursor:not-allowed}',
-    '.x{border:none;background:none;color:#b33;font-size:17px;cursor:pointer;line-height:1}',
-    '.actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
-    '.inline{display:flex;align-items:center;gap:6px;font-size:12px;color:#5a6474;white-space:nowrap}',
-    '.msg{font-weight:600}.msg.e{color:#b3261e}.msg.g{color:#1f7a4d}',
-    '.good{color:#1f7a4d;font-weight:700}.wrn{color:#a86400;font-weight:700}.bad{color:#b3261e;font-weight:700}',
-    '.hint{color:#889;font-size:12px;margin:8px 0 0}',
-    '.warn{margin:12px 0 0;padding:9px 11px;background:#fff8e6;border:1px solid #f0dca8;border-radius:6px;color:#6b4e00}',
-    'code{font-family:ui-monospace,Menlo,Consolas,monospace;background:#eef1f5;padding:1px 4px;border-radius:3px}'
+    '#' + w + ' .btn.ghost{background:#fff;color:#2b6cb0;margin-left:6px}',
+    '#' + w + ' .btn.go{background:#1f7a4d;border-color:#1f7a4d}',
+    '#' + w + ' .btn:disabled{opacity:.45;cursor:not-allowed}',
+    '#' + w + ' .x{border:none;background:none;color:#b33;font-size:17px;cursor:pointer;line-height:1}',
+    '#' + w + ' .actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
+    '#' + w + ' .inline{display:flex;align-items:center;gap:6px;font-size:12px;color:#5a6474;white-space:nowrap}',
+    '#' + w + ' .msg{font-weight:600}',
+    '#' + w + ' .msg.e{color:#b3261e}',
+    '#' + w + ' .msg.g{color:#1f7a4d}',
+    '#' + w + ' .good{color:#1f7a4d;font-weight:700}',
+    '#' + w + ' .wrn{color:#a86400;font-weight:700}',
+    '#' + w + ' .bad{color:#b3261e;font-weight:700}',
+    '#' + w + ' .hint{color:#889;font-size:12px;margin:8px 0 0}',
+    '#' + w + ' .warn{margin:12px 0 0;padding:9px 11px;background:#fff8e6;border:1px solid #f0dca8;border-radius:6px;color:#6b4e00}',
+    '#' + w + ' code{font-family:ui-monospace,Menlo,Consolas,monospace;background:#eef1f5;padding:1px 4px;border-radius:3px}'
   ].join('');
 
   const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
