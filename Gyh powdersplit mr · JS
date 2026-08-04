@@ -149,7 +149,7 @@ define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
     const origName   = String(row.partNumber).trim();
     const parentName = String(row.parentName).trim();
     const phantomId  = Number(row.phantomItemId);
-    const colorLabel = String(row.colorLabel || '').trim();
+    const colorText  = String(row.colorText || '').trim();
     const hangers    = Number(row.hangers);
     const runRate    = hangers;   // same number by definition -- see header note
     const fabBomId   = row.fabBomId ? Number(row.fabBomId) : null;
@@ -158,7 +158,7 @@ define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
     const cutover = parseDate(row.cutoverDate);          // new parent rev starts here
     const dayBefore = addDays(cutover, -1);              // old fab rev ends here
 
-    let origId, childId, baseDisplay;
+    let origId, childId, baseText;
 
     if (resume) {
       // A prior attempt already renamed the parent and copied out the child
@@ -169,8 +169,7 @@ define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
       origId = Number(row.parentInternalId);
       childId = Number(row.itemInternalId);
       const parentRec = record.load({ type: record.Type.ASSEMBLY_ITEM, id: origId, isDynamic: false });
-      baseDisplay = String(parentRec.getValue({ fieldId: 'displayname' }) || '')
-        .replace(new RegExp('\\s*' + colorLabel + '\\s*$', 'i'), '').trim();
+      baseText = readDescriptions(parentRec, colorText);
       result.created.parentId = origId;
       result.created.parentName = parentName;
       result.created.childId = childId;
@@ -182,11 +181,12 @@ define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
 
       // ------------------------------------------------ 1. rename the original
       const parent = record.load({ type: record.Type.ASSEMBLY_ITEM, id: origId, isDynamic: false });
-      baseDisplay = String(parent.getValue({ fieldId: 'displayname' }) || '').trim();
+      baseText = readDescriptions(parent, colorText);
       parent.setValue({ fieldId: 'itemid', value: parentName });
-      if (colorLabel && baseDisplay.toUpperCase().indexOf(colorLabel.toUpperCase()) === -1) {
-        parent.setValue({ fieldId: 'displayname', value: (baseDisplay + ' ' + colorLabel).trim() });
-      }
+      // The color goes on ALL THREE description fields, matching PROD: on
+      // 104655 - BK the display name, sales description and purchase
+      // description all read "... Textured Black".
+      applyDescriptions(parent, baseText, colorText);
       parent.setValue({ fieldId: 'costestimatetype', value: CFG.COST_ESTIMATE_TYPE });
       parent.save({ ignoreMandatoryFields: true });
       result.created.parentId = origId;
@@ -195,12 +195,29 @@ define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
       // -------------------------------------------- 2. copy out the bare child
       const child = record.copy({ type: record.Type.ASSEMBLY_ITEM, id: origId, isDynamic: false });
       child.setValue({ fieldId: 'itemid', value: origName });
-      child.setValue({ fieldId: 'displayname', value: baseDisplay });   // color-free
+      applyDescriptions(child, baseText, '');   // bare part: no color
       child.setValue({ fieldId: 'costestimatetype', value: CFG.COST_ESTIMATE_TYPE });
       adjustChild(child);
       childId = child.save({ ignoreMandatoryFields: true });
       result.created.childId = childId;
       result.created.childName = origName;
+    }
+
+    // On resume the rename already happened but the descriptions may not have
+    // been touched (the original run died before this was implemented), so
+    // apply them now.
+    if (resume && colorText) {
+      try {
+        const p = record.load({ type: record.Type.ASSEMBLY_ITEM, id: origId, isDynamic: false });
+        applyDescriptions(p, baseText, colorText);
+        p.save({ ignoreMandatoryFields: true });
+        const c = record.load({ type: record.Type.ASSEMBLY_ITEM, id: childId, isDynamic: false });
+        applyDescriptions(c, baseText, '');
+        c.save({ ignoreMandatoryFields: true });
+        result.notes.push('Descriptions back-filled with "' + colorText + '" on the parent.');
+      } catch (e) {
+        result.notes.push('Could not back-fill descriptions: ' + (e.message || e));
+      }
     }
 
     if (!fabBomId) {
@@ -282,6 +299,56 @@ define(['N/record', 'N/query', 'N/runtime', 'N/log', 'N/format', 'N/email'],
       attachBom(origId, bomId, true);
       result.created.routingId = createRouting(parentName, bomId, runRate);
     }
+  };
+
+  // ------------------------------------------------------- description fields
+  // In PROD the color appears on all three of these. NetSuite field IDs:
+  //   displayname         -> Display Name/Code
+  //   salesdescription    -> Sales Order Description (SuiteQL: description)
+  //   purchasedescription -> Purchase Description
+  const DESC_FIELDS = ['displayname', 'salesdescription', 'purchasedescription'];
+
+  /**
+   * Read the base (color-free) description text off an item. Prefers
+   * displayname, falls back to the others, and strips a trailing color if one
+   * is already present so re-running can't double it up.
+   */
+  const readDescriptions = (rec, colorText) => {
+    let base = '';
+    for (let i = 0; i < DESC_FIELDS.length && !base; i++) {
+      try { base = String(rec.getValue({ fieldId: DESC_FIELDS[i] }) || '').trim(); }
+      catch (e) { /* field not present */ }
+    }
+    return stripColor(base, colorText);
+  };
+
+  /** Remove a trailing color name, with or without a separating comma. */
+  const stripColor = (text, colorText) => {
+    let out = String(text || '').trim();
+    if (!colorText) return out;
+    const esc = String(colorText).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    out = out.replace(new RegExp('[,\\s]*' + esc + '\\s*$', 'i'), '').trim();
+    return out.replace(/,$/, '').trim();
+  };
+
+  /**
+   * Write base text plus the color onto every description field. Passing an
+   * empty colorText writes the bare text, which is what the child gets.
+   */
+  const applyDescriptions = (rec, baseText, colorText) => {
+    const value = colorText ? (baseText + ' ' + colorText).trim() : baseText;
+    DESC_FIELDS.forEach((f) => {
+      try {
+        const current = String(rec.getValue({ fieldId: f }) || '').trim();
+        // only rewrite fields that actually carry the description, so a blank
+        // purchase description stays blank rather than being invented
+        if (current || f === 'displayname') {
+          rec.setValue({ fieldId: f, value: value });
+        }
+      } catch (e) {
+        log.audit('Could not set ' + f, e.message);
+      }
+    });
   };
 
   /**
