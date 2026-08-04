@@ -57,7 +57,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/task', 'N/runtime', 'N/log'],
 
     MR_SCRIPT_ID: 'customscript5496',      // confirmed on the Script record in SB2 08/2026
     MR_DEPLOY_ID: 'customdeploy1',         // confirmed on the Deployment record in SB2 08/2026
-    MR_PARAM: 'custscript_gyh_pcs_payload'
+    MR_PARAM: 'custscriptgyh_pcs_payload'  // confirmed on the Deployment Parameters tab in SB2 08/2026
   };
 
   // ------------------------------------------------------------ entry point
